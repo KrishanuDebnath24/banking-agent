@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if os.environ.get("BANK_TEST") != "1":
     load_dotenv(ROOT / ".env", override=True)
 
-from agents.context import VISIBLE_ROLES, _first_seed_time  # noqa: E402
+from agents.context import VISIBLE_ROLES, _first_seed_time, account_key  # noqa: E402
 from obp.client import OBPClient, OBPError  # noqa: E402
 
 DEMO_FILE = Path(os.environ.get("DEMO_ACCOUNTS_FILE", ROOT / "demo_accounts.json"))
@@ -35,13 +35,15 @@ DEMO_FILE = Path(os.environ.get("DEMO_ACCOUNTS_FILE", ROOT / "demo_accounts.json
 def _make_client():
     if os.environ.get("OBP_FAKE") == "1":
         from obp.fake import FakeOBP
-        return FakeOBP.from_demo(DEMO_FILE)
+        fixture = os.environ.get("OBP_FAKE_FIXTURE")  # the fixed eval bank (evals/fixture.py)
+        return FakeOBP.from_fixture(fixture) if fixture else FakeOBP.from_demo(DEMO_FILE)
     return OBPClient.from_env()
 
 
 CLIENT = _make_client()
-PORTS = {"accounts": 8101, "transactions": 8102, "service": 8103,
-         "verify": 8104}  # security codes (plain HTTP, not MCP)
+_OFFSET = int(os.environ.get("MCP_PORT_OFFSET", "0"))  # evals and tests run a second set of servers
+PORTS = {"accounts": 8101 + _OFFSET, "transactions": 8102 + _OFFSET, "service": 8103 + _OFFSET,
+         "verify": 8104 + _OFFSET}  # verify: security codes (plain HTTP, not MCP)
 
 
 @dataclass
@@ -55,12 +57,13 @@ class Customer:
     show_since: str | None = None
 
     def resolve(self, account: str | None) -> str | None:
+        """ "current", "my current account", or this customer's own account id -> the id; else None."""
         if account is None:
             return None
-        key = account.strip().lower()
+        key = account_key(account)
         if key in self.accounts:
             return self.accounts[key]
-        return account if account in self.accounts.values() else None
+        return account.strip() if account.strip() in self.accounts.values() else None
 
     def name_of(self, account_id: str) -> str:
         return next((n for n, i in self.accounts.items() if i == account_id), account_id)
@@ -107,7 +110,8 @@ def _lookup(token: str) -> Customer:
         if c["username"] == username:
             cust = Customer(label=label, username=username, token=token, bank_id=demo["bank_id"],
                             currency=c["currency"], accounts={r: c[r] for r in VISIBLE_ROLES},
-                            show_since=_first_seed_time(label))
+                            # The shared sandbox has years of other people's test data; the fake bank doesn't.
+                            show_since=None if os.environ.get("OBP_FAKE") == "1" else _first_seed_time(label))
             _CACHE[key] = (cust, time.time() + 300)
             return cust
     raise PermissionError("this user is not a demo customer")

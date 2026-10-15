@@ -9,6 +9,7 @@ model output. That keeps identity and authorisation out of the LLM's hands.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -17,6 +18,16 @@ from obp.client import OBPClient
 
 ROOT = Path(__file__).resolve().parent.parent
 VISIBLE_ROLES = ("current", "savings")  # hidden helper accounts never reach the agent
+
+_FILLER = re.compile(r"\b(?:my|the|our|account|acct|a/c)\b", re.I)
+_ALIASES = {"saving": "savings", "savings": "savings", "current": "current"}
+
+
+def account_key(name: str) -> str:
+    """How customers say it -> the account's name: "my Current Account" -> "current",
+    "savings acct" -> "savings". Anything else ("joint account") stays unrecognised."""
+    key = " ".join(_FILLER.sub(" ", name or "").split()).lower()
+    return _ALIASES.get(key, key)
 
 
 @dataclass(kw_only=True)
@@ -33,10 +44,10 @@ class CustomerContext:
 
     def resolve(self, account: str) -> str | None:
         """Map a name ('current') or id to an allowed account id, else None."""
-        key = account.strip().lower()
+        key = account_key(account)
         if key in self.accounts:
             return self.accounts[key]
-        return account if account in self.accounts.values() else None
+        return account.strip() if account.strip() in self.accounts.values() else None
 
 
 def _first_seed_time(label: str) -> str | None:

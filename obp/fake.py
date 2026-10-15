@@ -54,6 +54,32 @@ class FakeOBP:
                           "Netflix.com")
         return fake
 
+    @classmethod
+    def from_fixture(cls, fixture_file: str | Path) -> "FakeOBP":
+        """A fixed bank with dated transactions (see evals/fixture.py), for repeatable evals."""
+        data = json.loads(Path(fixture_file).read_text())
+        users, balances, customers, txns, attributes = {}, {}, {}, {}, {}
+        for label, c in data["customers"].items():
+            users[f"fake-token-{label}"] = {"user_id": f"user-{label}", "username": c["username"]}
+            customers[c["username"]] = {"customer_id": f"cust-{label}", "customer_number": c["customer_number"],
+                                        "legal_name": c["legal_name"], "email": c["username"],
+                                        "mobile_phone_number": c["mobile"], "kyc_status": True}
+            for acc in c["accounts"].values():
+                balances[acc["id"]] = acc["opening"]
+                txns[acc["id"]] = []
+            if c.get("address"):  # the address on file, stored like the real demo stores it
+                attributes[f"user-{label}"] = [{"user_attribute_id": f"attr-{label}", "name": "ADDRESS",
+                                                "type": "STRING", "value": c["address"],
+                                                "insert_date": "2026-07-01T09:00:00Z"}]
+            for t in sorted(c["transactions"], key=lambda t: t["date"]):
+                acc = c["accounts"][t["account"]]["id"]
+                balances[acc] = round(balances[acc] + t["amount"], 2)
+                txns[acc].insert(0, {"details": {
+                    "completed": f"{t['date']}T09:00:00Z", "description": t["description"],
+                    "value": {"currency": c["currency"], "amount": f"{t['amount']:.2f}"},
+                    "new_balance": {"currency": c["currency"], "amount": f"{balances[acc]:.2f}"}}})
+        return cls(users=users, balances=balances, txns=txns, customers=customers, attributes=attributes)
+
     # ---- helpers ----
     def _user(self, token: str) -> dict:
         if token not in self.users:

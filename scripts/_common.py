@@ -17,9 +17,13 @@ from obp.client import OBPClient  # noqa: E402
 DEMO_ACCOUNTS_FILE = ROOT / "demo_accounts.json"
 
 
-def setup() -> tuple[OBPClient, str]:
+def load_env() -> None:
     # override=True: values in .env win over old ones set in Windows / the shell
     load_dotenv(ROOT / ".env", override=True)
+
+
+def setup() -> tuple[OBPClient, str]:
+    load_env()
     return OBPClient.from_env(), os.environ.get("OBP_BANK_ID", "gh.29.uk")
 
 

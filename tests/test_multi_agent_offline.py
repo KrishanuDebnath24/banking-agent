@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import warnings
 from pathlib import Path
 
@@ -34,7 +35,9 @@ DEMO.write_text(json.dumps({"bank_id": "gh.29.uk", "customers": {
           "income": "a-inc", "merchants": "a-mer", "funding": []},
     "B": {"username": "anil.uk.29@example.com", "currency": "GBP", "current": "b-cur", "savings": "b-sav",
           "income": "b-inc", "merchants": "b-mer", "funding": []}}}))
-TEST_ENV = {"BANK_TEST": "1", "OBP_FAKE": "1", "DEMO_ACCOUNTS_FILE": str(DEMO),
+TEST_ENV = {"BANK_TEST": "1", "TELEMETRY_DB": "off", "MCP_PORT_OFFSET": "200",  # own ports: 8301-8304
+            "MCP_ACCOUNTS_URL": "http://127.0.0.1:8301/mcp", "MCP_TRANSACTIONS_URL": "http://127.0.0.1:8302/mcp",
+            "MCP_SERVICE_URL": "http://127.0.0.1:8303/mcp", "VERIFY_URL": "http://127.0.0.1:8304", "OBP_FAKE": "1", "DEMO_ACCOUNTS_FILE": str(DEMO),
             "SERVICE_REQUESTS_FILE": str(TMP / "requests.jsonl"), "LANGSMITH_TRACING": "false",
             "EMAIL_BACKEND": "console", "OTP_OUTBOX": str(OUTBOX), "OTP_DB": str(TMP / "verification.db"),
             "OTP_TRANSFER_THRESHOLD": "100", "OTP_EMAIL_TO": "me@demo.test"}
@@ -47,6 +50,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # noqa: E402
 from langgraph.types import Command  # noqa: E402
 
 from agents.coordinator import build_coordinator, load_mcp_tools  # noqa: E402
+from observability import costs  # noqa: E402
 from scripts.chat_multi import CODE_NOT_CONFIRMED, security_code  # noqa: E402
 
 
@@ -56,7 +60,14 @@ class Fake(GenericFakeChatModel):
 
 
 def call(name, **args):
-    return AIMessage(content="", tool_calls=[{"name": name, "id": f"id-{time.time_ns()}", "args": args}])
+    return AIMessage(content="", tool_calls=[{"name": name, "id": f"id-{uuid.uuid4().hex}", "args": args}])
+
+
+def priced(message):
+    """Attach token usage like a real Claude response, for the cost meter."""
+    message.usage_metadata = {"input_tokens": 1000, "output_tokens": 50, "total_tokens": 1050}
+    message.response_metadata = {"model_name": "claude-haiku-5-5"}
+    return message
 
 
 def task(agent, description):
@@ -102,11 +113,13 @@ async def balances(token="fake-token-A"):
     return {a["account"]: a["balance"] for a in await tool(token, "accounts", "list_my_accounts")}
 
 
-async def scenario(db, thread, script, user_text, decide=None, token="fake-token-A"):
+async def scenario(db, thread, script, user_text, decide=None, token="fake-token-A", meter=None):
     """Run one turn. `decide(action)` returns the decision for a paused action, like the chat app."""
     async with AsyncSqliteSaver.from_conn_string(str(db)) as saver:
-        agent = await build_coordinator(token, saver, model=Fake(messages=iter(script)))
+        agent = await build_coordinator(token, saver, model=Fake(messages=iter(script)), bedrock=False)
         cfg = {"configurable": {"thread_id": thread}}
+        if meter is not None:
+            cfg["callbacks"] = [costs.CostCallback(meter)]
         await agent.ainvoke({"messages": [{"role": "user", "content": user_text}]}, cfg)
         state = await agent.aget_state(cfg)
         actions = [a for i in state.interrupts for a in i.value["action_requests"]]
@@ -141,13 +154,20 @@ async def main() -> int:
     start = await balances()
     print("start balances:", start)
 
-    # 1. Small transfer: pauses for y/N, needs no code, moves money.
+    # 1. Small transfer: pauses for y/N, needs no code, moves money. Also checks the cost meter.
     sent_before = emails()
+    meter = costs.start_turn("A-t1", "A")
     pending, st = await scenario(db, "A-t1", [
-        task("accounts-agent", "Transfer £50.00 from current to savings."),
-        call("transfer_between_my_accounts", from_account="current", to_account="savings", amount=50),
-        AIMessage(content="Transferred £50.00."), AIMessage(content="Done.")],
-        "move £50 to savings", approve_with_code())
+        priced(task("accounts-agent", "Transfer £50.00 from current to savings.")),
+        priced(call("transfer_between_my_accounts", from_account="current", to_account="savings", amount=50)),
+        priced(AIMessage(content="Transferred £50.00.")), priced(AIMessage(content="Done."))],
+        "move £50 to savings", approve_with_code(), meter=meter)
+    costs.end_turn(meter, save=False)
+    agents_seen = {c["agent"] for c in meter.llm_calls}
+    check("cost meter sees all 4 model calls, coordinator and subagent",
+          len(meter.llm_calls) == 4 and "accounts-agent" in agents_seen and len(agents_seen) == 2)
+    check("cost meter prices them", abs(meter.llm_cost - 4 * (1000 * 0.10 + 50 * 0.50) / 1e6) < 1e-9)
+    print("   agents seen by the cost meter:", sorted(agents_seen))
     after = await balances()
     check("transfer pauses for approval", pending == ["transfer_between_my_accounts"])
     check("£50 transfer needs no security code", emails() == sent_before)
@@ -212,7 +232,7 @@ async def main() -> int:
 
     # 7. Another customer can't use A's code.
     import httpx
-    async with httpx.AsyncClient(base_url="http://127.0.0.1:8104") as http:
+    async with httpx.AsyncClient(base_url=os.environ["VERIFY_URL"]) as http:
         a = (await http.post("/verify/start", headers={"Authorization": 'DirectLogin token="fake-token-A"'},
                              json={"tool": "change_address", "args": {"new_address": "9 Elm Road, Cork T12 AB34"}})).json()
         b = (await http.post("/verify/check", headers={"Authorization": 'DirectLogin token="fake-token-B"'},
@@ -258,7 +278,7 @@ async def main() -> int:
         call("request_cheque_book", account="current")], "cheque book please")
     check("cheque book pauses for approval", pending == ["request_cheque_book"])
     async with AsyncSqliteSaver.from_conn_string(str(db)) as saver:  # "restart": new saver, new agent
-        agent = await build_coordinator("fake-token-A", saver, model=Fake(messages=iter([
+        agent = await build_coordinator("fake-token-A", saver, bedrock=False, model=Fake(messages=iter([
             AIMessage(content="Cheque book ordered."), AIMessage(content="Your cheque book is on its way.")])))
         cfg = {"configurable": {"thread_id": "A-t10"}}
         state = await agent.aget_state(cfg)
@@ -274,6 +294,10 @@ async def main() -> int:
     check("server refuses A reading B's account", as_a.get("error") == "access_denied")
     check("server allows B reading B's own account", "balance" in as_b)
     check("server refuses an unknown token", bad.get("error") == "not_authorised")
+    said = await tool("fake-token-A", "accounts", "get_balance", account="my Current Account")
+    joint = await tool("fake-token-A", "accounts", "get_balance", account="joint account")
+    check("'my Current Account' is understood as current", said.get("account") == "current")
+    check("'joint account' is still refused", joint.get("error") == "access_denied")
 
     print("\nALL MULTI-AGENT CHECKS PASSED" if ok else "\nSOME CHECKS FAILED")
     return 0 if ok else 1

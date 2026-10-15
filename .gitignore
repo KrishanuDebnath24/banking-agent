@@ -7,3 +7,5 @@ sessions.db-*
 service_requests.jsonl
 verification.db
 demo_accounts.json
+telemetry.db
+evals/results/

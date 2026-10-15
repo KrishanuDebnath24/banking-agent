@@ -56,8 +56,9 @@ def ollama_base_url() -> str:
     return os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 
 
-def make_model():
-    spec = model_spec()
+def make_model(spec: str | None = None):
+    """The model named in .env (MODEL), or the given spec, e.g. "anthropic:claude-sonnet-5-5"."""
+    spec = spec or model_spec()
     provider, _, name = spec.partition(":")  # "ollama:qwen3:14b" -> ("ollama", "qwen3:14b")
 
     if provider == "ollama":

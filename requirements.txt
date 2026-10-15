@@ -11,3 +11,7 @@ deepagents>=0.7.24,<0.8               # coordinator + subagents (beta API, so pi
 langchain-mcp-adapters>=0.3
 mcp>=1.30
 langgraph-checkpoint-sqlite>=3.1      # session store (Postgres on AWS in phase 4)
+# phase 3: guardrails, costs, evals
+boto3>=1.35                            # Amazon Bedrock Guardrails (ApplyGuardrail)
+# phase 4: web API
+fastapi>=0.115

@@ -145,6 +145,81 @@ https://myaccount.google.com/apppasswords, then in `.env` set `EMAIL_BACKEND=smt
 python -m scripts.check_codes     # settings, a test email, and saving to the bank profile
 ```
 
+## 7. Phase 3: guardrails, costs and evals
+
+### Guardrails: three layers, cheapest first
+
+| Layer | What it does | Cost |
+|---|---|---|
+| 1. Rules (`guardrails/`, LangChain middleware) | Blocks card numbers, CVVs, PINs, passwords and security codes typed into the chat and removes them from the conversation before any model, store or trace sees them. Masks emails and phone numbers. Masks card/IBAN/account numbers and internal ids in replies. Caps model and tool calls per turn. | free, instant, always on |
+| 2. Amazon Bedrock Guardrails | Prompt attacks (jailbreaks, injection), harmful content, denied topics (investment, tax and legal advice), ML-detected card data, and whether the answer is grounded in what the tools returned. Works with Claude on the Anthropic API too. | about $0.10-0.15 per 1,000 short checks |
+| 3. Hard controls (phase 2) | Server-side account checks, y/N confirmations, emailed security codes, the £850 limit. The real security boundary: even if 1 and 2 miss something, the agent can't move money or see another customer's data. | |
+
+Bedrock starts in **shadow mode**: it logs what it would block. Run the evals, check it doesn't block
+normal questions, then set `GUARDRAIL_MODE=enforce`. To set it up (needs `aws configure`):
+
+```bash
+python -m scripts.setup_guardrail --test     # creates it from guardrails/bedrock_policy.py
+```
+
+LangSmith traces are redacted before they leave your PC (codes, card data, emails, phones, IBANs,
+postcodes, address fields). `LANGSMITH_HIDE_CONTENT=true` sends no message text at all.
+
+### Cost tracker
+
+Every model call (coordinator and subagents) and every Bedrock check is priced and shown after
+each turn (`[cost] $0.00093 · 4 model calls · 9.2k tokens · 3.1s`), and saved to `telemetry.db`.
+
+```bash
+python -m scripts.cost_report --days 30      # per day, customer, agent, model, and guardrails
+```
+
+### Eval suite
+
+39 cases on a fixed fake bank (`evals/fixture.py`), so answers are known and transfers are safe:
+balances, spending, statements, follow-ups, write actions, security, prompt injection (including
+instructions hidden in a transaction description), PII and scope. Code checks the figures, the
+subagents and tools used, proposed actions, leaks, guardrails and efficiency; Claude Sonnet 5.5
+judges refusals and grounding with `--judge`.
+
+```bash
+python -m evals.run                          # all cases (+ a LangSmith experiment if a key is set)
+python -m evals.run --judge                  # add the judge
+python -m evals.run --category security --repeat 3
+python -m evals.run --list
+```
+
+Gates (exit code 1 if any fails): security, injection and PII cases 100%; overall pass rate 90%;
+average cost per case $0.01; p95 latency 45 s; no harness errors. `.github/workflows/ci.yml`
+runs the offline tests on every push and the eval suite on pull requests, main and nightly.
+
+Offline tests: `python tests/test_guardrails.py` and `python tests/test_evals_offline.py`
+
+## 8. Phase 4, step 1: web chat
+
+The same agents and safety rules, behind a web API and a chat page.
+
+Terminal 1: `python -m mcp_servers.run`   Terminal 2: `python -m api`   Then open http://127.0.0.1:8000
+
+- Sign in as a demo customer (Robert or Anil). On AWS this becomes the bank's sign-in (Cognito).
+- Transfers and service requests appear as a payment slip with Approve and Decline. Address changes and
+  transfers from £500 ask for the emailed code on the slip itself.
+- "What happened" shows, for each answer, the specialist, the bank tools and arguments, any guardrail
+  that stepped in, and the cost.
+- The bank token stays on the server: the browser only holds a random session id (HttpOnly,
+  SameSite=Strict cookie). Customers can only open their own conversations. Security headers and a
+  per-session rate limit are on.
+
+| Endpoint | What it does |
+|---|---|
+| `POST /api/login` | demo sign-in `{customer: "A"}` (AUTH_MODE=dev only) |
+| `POST /api/chat` | `{message, thread_id?}` -> an answer, or a confirmation slip |
+| `POST /api/confirm` | `{thread_id, approve, code?}` -> code needed, wrong code, or the answer |
+| `GET /api/history` | a conversation's messages, and any slip still waiting |
+| `GET /healthz` | for the load balancer |
+
+Offline test (no keys): `python tests/test_api_offline.py`
+
 ## Layout
 
 ```
@@ -173,4 +248,24 @@ scripts/probe_challenge.py     showed OBP needs a second approver above the limi
 agents/coordinator.py          phase 2: Deep Agents coordinator + 3 subagents
 scripts/chat_multi.py          phase 2 terminal chat with confirmations
 tests/test_multi_agent_offline.py  phase 2 end-to-end test
+guardrails/pii.py              deterministic PII detection and masking
+guardrails/middleware.py       input/output guardrails, contact masking, call limits
+guardrails/bedrock.py          Amazon Bedrock Guardrails client (shadow/enforce)
+guardrails/bedrock_policy.py   the Bedrock guardrail, as code
+observability/costs.py         per-turn cost meter and the telemetry.db ledger
+observability/tracing.py       PII redaction for LangSmith traces
+scripts/setup_guardrail.py     create/update the Bedrock guardrail
+scripts/cost_report.py         cost report from the ledger
+evals/fixture.py               the fixed eval bank and its oracle
+evals/cases.py                 the 39 eval cases
+evals/harness.py               runs a case against the real agents
+evals/evaluators.py            code scorers + the Claude judge
+evals/run.py                   the eval CLI, gates, LangSmith experiments
+tests/test_guardrails.py       guardrails, costs, trace redaction
+tests/test_evals_offline.py    the eval machinery, with a scripted model
+.github/workflows/ci.yml       offline tests + eval gates in CI
+api/app.py                     web API: sessions, chat, confirmations with codes, history
+api/actions.py                 what each action looks like on the confirmation slip
+web/                           the chat page (index.html, app.css, app.js)
+tests/test_api_offline.py      the web API end to end, with a scripted model
 ```

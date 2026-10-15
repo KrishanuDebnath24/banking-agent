@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Demo Bank assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;600;700&display=swap">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="bar">
+    <a class="brand" href="./" aria-label="Demo Bank assistant, start page">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Demo Bank</span>
+      <span class="brand-sub">assistant</span>
+    </a>
+    <div class="who" id="who" hidden>
+      <span id="who-name"></span>
+      <button class="link" id="new-chat" type="button">New conversation</button>
+      <button class="link" id="sign-out" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main id="sign-in" class="sign-in" hidden>
+    <h1>Sign in to the demo</h1>
+    <p>Choose a demo customer. In the AWS version this is replaced by the bank's own sign-in.</p>
+    <div class="customers" id="customers"></div>
+    <p class="note">Demo Bank is fictional. Accounts and transactions come from a test bank.</p>
+  </main>
+
+  <main id="chat" class="chat" hidden>
+    <section class="conversation" aria-label="Conversation">
+      <div class="log" id="log" aria-live="polite">
+        <div class="empty" id="empty">
+          <h1>How can I help?</h1>
+          <p>Ask about your balances, your spending, moving money between your current and savings accounts, or your address.</p>
+          <div class="suggestions">
+            <button type="button" class="suggestion">What are my balances?</button>
+            <button type="button" class="suggestion">How much did I spend on groceries last month?</button>
+            <button type="button" class="suggestion">Move £20 from current to savings</button>
+          </div>
+        </div>
+      </div>
+      <form class="composer" id="composer" autocomplete="off">
+        <label class="visually-hidden" for="message">Message</label>
+        <textarea id="message" rows="1" maxlength="2000" placeholder="Ask about your accounts"></textarea>
+        <button type="submit" id="send">Send</button>
+      </form>
+    </section>
+
+    <aside class="trace" aria-label="What happened">
+      <details id="trace-toggle" open>
+        <summary>What happened</summary>
+        <p class="trace-intro">Each answer, step by step: which specialist helped, the bank tools it used, any guardrail that stepped in, and what it cost.</p>
+        <ol class="trace-list" id="trace"></ol>
+      </details>
+    </aside>
+  </main>
+
+  <template id="slip-template">
+    <div class="slip-wrap"><div class="slip" role="group">
+      <h2 class="slip-title"></h2>
+      <dl class="slip-rows"></dl>
+      <div class="slip-stub">
+        <form class="slip-code" hidden>
+          <label class="code-label"></label>
+          <input class="code-input" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*" maxlength="6" required>
+          <p class="code-note" aria-live="polite"></p>
+        </form>
+        <div class="slip-actions">
+          <button type="button" class="approve"></button>
+          <button type="button" class="decline">Decline</button>
+        </div>
+      </div>
+    </div></div>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>

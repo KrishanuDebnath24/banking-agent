@@ -1,0 +1,65 @@
+# Offline tests on every push (no keys, no network). The eval suite runs the real model on
+# pull requests, on main, nightly and on demand, and fails the build if a gate fails.
+#
+# Repository secrets needed for the eval job: ANTHROPIC_API_KEY, LANGSMITH_API_KEY.
+# Optional, to include the Bedrock guardrail: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and
+# the repository variables GUARDRAIL_ID / GUARDRAIL_VERSION.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python tests/test_guardrails.py
+      - run: python tests/test_agent_offline.py
+      - run: python tests/test_multi_agent_offline.py
+      - run: python tests/test_evals_offline.py
+      - run: python tests/test_api_offline.py
+
+  evals:
+    needs: offline-tests
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MODEL: anthropic:claude-haiku-5-5
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+      LANGSMITH_PROJECT: banking-agent-ci
+      GUARDRAIL_ID: ${{ vars.GUARDRAIL_ID }}
+      GUARDRAIL_VERSION: ${{ vars.GUARDRAIL_VERSION }}
+      GUARDRAIL_MODE: shadow
+      AWS_REGION: eu-west-1
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Eval suite (fails the build if a gate fails)
+        run: python -m evals.run --judge --repeat ${{ github.event_name == 'schedule' && 3 || 1 }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: evals/results/

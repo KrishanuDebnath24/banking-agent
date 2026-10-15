@@ -29,6 +29,8 @@ from langgraph.types import Command
 from scripts._common import ROOT, login, setup
 from agents.coordinator import build_coordinator
 from agents.llm import model_spec
+from guardrails.bedrock import BedrockGuard
+from observability import costs
 
 SESSION_DB = os.environ.get("SESSION_DB", str(ROOT / "sessions.db"))
 CODE_NOT_CONFIRMED = "The security code was not confirmed, so nothing was done."
@@ -64,9 +66,10 @@ async def run(agent, payload, config, shown: set) -> None:
             msgs = data.get("messages", [])
             for m in msgs if isinstance(msgs, list) else []:
                 for call in getattr(m, "tool_calls", None) or []:
-                    if call.get("id") in shown:
+                    key = (call.get("id"), call.get("name"), repr(call.get("args")))
+                    if key in shown:
                         continue
-                    shown.add(call.get("id"))
+                    shown.add(key)
                     if call["name"] == "task":
                         print(f"  -> {call['args'].get('subagent_type')}: {call['args'].get('description', '')[:110]}")
                     else:
@@ -136,6 +139,17 @@ async def confirm_pending(agent, config, shown: set, token: str) -> bool:
     return True
 
 
+def with_meter(config: dict, meter) -> dict:
+    """The turn's config: the cost meter sees every model call, subagents included."""
+    return {**config, "callbacks": [costs.CostCallback(meter)]}
+
+
+def report(meter) -> None:
+    for note in meter.guard_notes():
+        print(f"       [guardrail] {note}")
+    print(f"       [cost] {meter.summary_line()}\n")
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--customer", choices=["A", "B"], default="A")
@@ -150,9 +164,15 @@ async def main() -> int:
         return 1
 
     tracing = os.environ.get("LANGSMITH_TRACING", "").lower() == "true" and os.environ.get("LANGSMITH_API_KEY")
+    trace_note = ""
+    if tracing:
+        from observability.tracing import install_trace_redaction
+        trace_note = f" ({install_trace_redaction()})"
+    bedrock = BedrockGuard.from_env()
     config = {"configurable": {"thread_id": thread_id}, "run_name": "banking_multi_agent_turn",
-              "tags": ["phase2", f"customer-{args.customer}"],
-              "metadata": {"customer": args.customer, "thread_id": thread_id}}
+              "tags": ["phase3", f"customer-{args.customer}"],
+              "metadata": {"customer": args.customer, "thread_id": thread_id,
+                           "guardrail_mode": bedrock.mode if bedrock else "rules-only"}}
 
     async with AsyncSqliteSaver.from_conn_string(SESSION_DB) as saver:
         try:
@@ -163,12 +183,16 @@ async def main() -> int:
 
         print(f"Logged in as {username} (customer {args.customer}). Model: {model_spec()}")
         print(f"Conversation: {thread_id}   (continue later with --thread {thread_id})")
-        print("LangSmith tracing " + ("ON" if tracing else "OFF") + ". Type 'quit' to exit.\n")
+        print("Guardrails: rules ON; Bedrock " + (f"{bedrock.mode.upper()} ({bedrock.guardrail_id} v{bedrock.version})"
+                                                  if bedrock else "OFF (set GUARDRAIL_ID to turn on)"))
+        print("LangSmith tracing " + ("ON" + trace_note if tracing else "OFF") + ". Type 'quit' to exit.\n")
 
         # A conversation saved mid-confirmation picks up where it left off.
-        if await confirm_pending(agent, config, set(), token):
+        meter = costs.start_turn(thread_id, args.customer)
+        if await confirm_pending(agent, with_meter(config, meter), set(), token):
             state = await agent.aget_state(config)
-            print(f"bank> {text_of(state.values['messages'][-1])}\n")
+            print(f"bank> {text_of(state.values['messages'][-1])}")
+            report(costs.end_turn(meter))
 
         while True:
             try:
@@ -180,11 +204,14 @@ async def main() -> int:
             if not question:
                 continue
             shown: set = set()
-            await run(agent, {"messages": [{"role": "user", "content": question}]}, config, shown)
-            while await confirm_pending(agent, config, shown, token):
+            meter = costs.start_turn(thread_id, args.customer)
+            turn = with_meter(config, meter)
+            await run(agent, {"messages": [{"role": "user", "content": question}]}, turn, shown)
+            while await confirm_pending(agent, turn, shown, token):
                 pass
             state = await agent.aget_state(config)
-            print(f"bank> {text_of(state.values['messages'][-1])}\n")
+            print(f"bank> {text_of(state.values['messages'][-1])}")
+            report(costs.end_turn(meter))
 
     from langchain_core.tracers.langchain import wait_for_all_tracers
     wait_for_all_tracers()
