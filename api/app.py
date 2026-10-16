@@ -1,4 +1,4 @@
-"""Web API for the banking assistant (phase 4, step 1).
+"""Web API for the banking assistant (phase 4).
 
     python -m api              # http://127.0.0.1:8000   (start  python -m mcp_servers.run  first)
 
@@ -18,12 +18,18 @@ Security
 - Conversations belong to one customer: thread ids carry the customer's label and are checked.
 - Security codes go from the page to the verify service and are never put in the conversation.
 - Per-session rate limit, security headers, and the same guardrails as the terminal chat.
+
+State
+- Conversations (and any slip waiting for approval) are in the conversation store: Postgres when
+  DATABASE_URL is set, else SESSION_DB. A restart signs people out, but after signing in again
+  their conversation, and a waiting slip, come back.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -46,6 +52,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if os.environ.get("BANK_TEST") != "1":
     load_dotenv(ROOT / ".env", override=True)
 
+import storage  # noqa: E402
 from api.actions import SPECIALISTS, slip  # noqa: E402
 from observability import costs  # noqa: E402
 
@@ -55,6 +62,7 @@ RATE_LIMIT = int(os.environ.get("API_RATE_LIMIT_PER_MIN", "30"))
 DECLINED = "The customer declined this action."
 CODE_NOT_CONFIRMED = "The security code was not confirmed, so nothing was done."
 THREAD_RE = re.compile(r"^[AB]-[0-9a-f]{8}$")
+log = logging.getLogger("bank.api")
 
 
 # ---------- request bodies ----------
@@ -176,9 +184,7 @@ def create_app(model_factory=None) -> FastAPI:
     async def saver():
         async with saver_lock:
             if state["saver"] is None:
-                from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-                path = os.environ.get("SESSION_DB", str(ROOT / "sessions.db"))
-                state["saver"] = await stack.enter_async_context(AsyncSqliteSaver.from_conn_string(path))
+                state["saver"] = await stack.enter_async_context(storage.checkpointer())
             return state["saver"]
 
     def session_of(request: Request) -> Session:
@@ -212,8 +218,13 @@ def create_app(model_factory=None) -> FastAPI:
                 sess.agent = await build_coordinator(sess.token, await saver(),
                                                      model=model_factory() if model_factory else None)
             except Exception as e:  # noqa: BLE001
-                raise HTTPException(503, "The bank service isn't reachable. Start it with: "
-                                         "python -m mcp_servers.run") from e
+                # The reason goes to the server log (docker compose logs api / CloudWatch).
+                log.exception("can't reach the bank servers (%s): %s", type(e).__name__,
+                              ", ".join(os.environ.get(k, "default") for k in
+                                        ("MCP_ACCOUNTS_URL", "MCP_TRANSACTIONS_URL", "MCP_SERVICE_URL")))
+                raise HTTPException(503, "The bank service isn't reachable right now. If you run the app "
+                                         "with Python, start  python -m mcp_servers.run  first; in Docker, "
+                                         "see  docker compose logs mcp") from e
         return sess.agent
 
     async def run(sess: Session, thread_id: str, payload, meter, steps: list) -> dict:
@@ -229,7 +240,9 @@ def create_app(model_factory=None) -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001 - model or bank failure mid-turn
-            costs.end_turn(meter)
+            # The customer gets a short apology; the reason goes to the server log (CloudWatch on AWS).
+            log.exception("turn failed (thread %s): %s", thread_id, type(e).__name__)
+            await end_turn(meter)
             raise HTTPException(502, "I couldn't finish that just now. Please try again.") from e
         return config
 
@@ -253,19 +266,37 @@ def create_app(model_factory=None) -> FastAPI:
                             steps.append({"kind": "tool", "name": call["name"], "args": call.get("args", {}),
                                           "specialist": specialist})
 
+    async def end_turn(meter) -> None:
+        await asyncio.to_thread(costs.end_turn, meter)  # the ledger write mustn't hold up other customers
+
+    def waiting(st) -> list[tuple[str, dict]]:
+        """(interrupt id, action) for every write action this conversation is waiting on."""
+        return [(i.id, a) for i in st.interrupts for a in (i.value or {}).get("action_requests", [])]
+
+    async def pending_of(sess: Session, thread_id: str) -> Pending | None:
+        """The slip this conversation is waiting on. After a restart it is rebuilt from the
+        conversation store, which keeps the interrupt."""
+        if thread_id not in sess.pending:
+            agent = await agent_for(sess)
+            items = waiting(await agent.aget_state({"configurable": {"thread_id": thread_id}}))
+            if not items:
+                return None
+            sess.pending[thread_id] = Pending(items=items)
+        return sess.pending[thread_id]
+
     async def finish(sess: Session, thread_id: str, meter, steps: list) -> dict:
         """After a step: either a new confirmation slip, or the answer."""
         agent = await agent_for(sess)
         st = await agent.aget_state({"configurable": {"thread_id": thread_id}})
         common = {"thread_id": thread_id, "steps": steps}
-        if st.interrupts:
-            items = [(i.id, a) for i in st.interrupts for a in i.value.get("action_requests", [])]
+        items = waiting(st)
+        if items:
             sess.pending[thread_id] = Pending(items=items)
-            costs.end_turn(meter)
+            await end_turn(meter)
             return {**common, "status": "needs_confirmation", "slip": slip(items[0][1]),
                     **_meter(meter)}
         sess.pending.pop(thread_id, None)
-        costs.end_turn(meter)
+        await end_turn(meter)
         return {**common, "status": "answered", "answer": _text(st.values["messages"][-1]), **_meter(meter)}
 
     def _meter(meter) -> dict:
@@ -336,9 +367,10 @@ def create_app(model_factory=None) -> FastAPI:
         if lock.locked():
             raise HTTPException(409, "Still working on your last message.")
         async with lock:
-            if thread_id in sess.pending:
+            waiting_slip = await pending_of(sess, thread_id)
+            if waiting_slip is not None:
                 return JSONResponse({"thread_id": thread_id, "status": "needs_confirmation",
-                                     "slip": slip(sess.pending[thread_id].current or {})}, status_code=409)
+                                     "slip": slip(waiting_slip.current or {})}, status_code=409)
             meter = costs.start_turn(thread_id, sess.customer)
             steps: list = []
             await run(sess, thread_id, {"messages": [{"role": "user", "content": body.message}]}, meter, steps)
@@ -352,7 +384,7 @@ def create_app(model_factory=None) -> FastAPI:
         if lock.locked():
             raise HTTPException(409, "Still working on your last request.")
         async with lock:
-            pending = sess.pending.get(thread_id)
+            pending = await pending_of(sess, thread_id)
             if pending is None or pending.current is None:
                 raise HTTPException(409, "There's nothing waiting for confirmation.")
             action = pending.current
@@ -398,7 +430,7 @@ def create_app(model_factory=None) -> FastAPI:
                 text = _text(m)
                 if text.strip():
                     messages.append({"role": "you" if kind == "human" else "bank", "text": text})
-        pending = sess.pending.get(thread_id)
+        pending = await pending_of(sess, thread_id)
         return {"thread_id": thread_id, "messages": messages,
                 "slip": slip(pending.current) if pending and pending.current else None}
 

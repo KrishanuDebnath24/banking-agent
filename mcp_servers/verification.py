@@ -19,7 +19,8 @@ HTTP API on port 8104, called by the chat app with the customer's OBP token:
         -> {"verified": true}  |  {"verified": false, "error": ..., "attempts_left": 2}
 
 Settings (.env): OTP_TRANSFER_THRESHOLD, OTP_EMAIL_TO, EMAIL_BACKEND (console|smtp),
-SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM, OTP_DB.
+SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM.
+Codes are kept (hashed) in the challenges table: Postgres if DATABASE_URL is set, else OTP_DB.
 """
 
 from __future__ import annotations
@@ -31,20 +32,19 @@ import json
 import os
 import secrets
 import smtplib
-import sqlite3
 import ssl
 import threading
 import time
 from contextlib import contextmanager
 from email.message import EmailMessage
-from pathlib import Path
 
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from mcp_servers.common import CLIENT, ROOT, Customer, customer_for_token, token_from_header
+from mcp_servers.common import CLIENT, Customer, customer_for_token, token_from_header
+from storage import OTP
 
 CODE_TTL = 300          # seconds a code is valid, and how long a confirmed code may be used
 MAX_ATTEMPTS = 3        # wrong guesses before a code is dead
@@ -56,7 +56,7 @@ TRANSFER = "transfer_between_my_accounts"
 ADDRESS = "change_address"
 PROTECTED_ARGS = {TRANSFER: ("from_account", "to_account", "amount"), ADDRESS: ("new_address",)}
 
-_LOCK = threading.Lock()
+_LOCK = threading.Lock()  # one process; across processes, Postgres advisory locks (db.lock)
 
 
 class VerificationError(Exception):
@@ -114,17 +114,12 @@ def fingerprint(tool: str, args: dict) -> str:
 # ---------- storage ----------
 
 @contextmanager
-def _db():
-    """One short transaction: committed if the block finishes, rolled back on an error."""
-    con = sqlite3.connect(os.environ.get("OTP_DB", str(ROOT / "verification.db")), timeout=10)
-    try:
-        con.execute("""CREATE TABLE IF NOT EXISTS challenges (
-            id TEXT PRIMARY KEY, customer TEXT, tool TEXT, fingerprint TEXT, salt TEXT, code_hash TEXT,
-            created REAL, expires REAL, attempts INTEGER DEFAULT 0, verified REAL, used REAL)""")
-        yield con
-        con.commit()
-    finally:
-        con.close()
+def _db(cust: Customer):
+    """One short transaction on the challenges table, holding this customer's lock until it ends,
+    so two requests (or two servers) can't both use one code or both slip past the rate limit."""
+    with _LOCK, OTP.connect() as db:
+        db.lock(f"otp:{cust.username}")
+        yield db
 
 
 def _hash(salt: str, code: str) -> str:
@@ -187,7 +182,7 @@ def start(cust: Customer, tool: str, args: dict) -> dict:
     now, fp = time.time(), fingerprint(tool, args)
     code = f"{secrets.randbelow(1_000_000):06d}"
     salt, challenge_id = secrets.token_hex(8), secrets.token_urlsafe(12)
-    with _LOCK, _db() as con:
+    with _db(cust) as con:
         sent = con.execute("SELECT COUNT(*) FROM challenges WHERE customer=? AND created>?",
                            (cust.username, now - RATE_WINDOW)).fetchone()[0]
         if sent >= MAX_CODES:
@@ -206,7 +201,7 @@ def start(cust: Customer, tool: str, args: dict) -> dict:
     try:
         send_email(to, "Your banking demo security code", body)
     except Exception as e:  # noqa: BLE001
-        with _LOCK, _db() as con:
+        with _db(cust) as con:
             con.execute("DELETE FROM challenges WHERE id=?", (challenge_id,))
         raise VerificationError("email_failed", f"Could not send the code email ({type(e).__name__}).", 502) from e
     return {"required": True, "challenge_id": challenge_id, "sent_to": mask(to), "expires_in": CODE_TTL}
@@ -215,7 +210,7 @@ def start(cust: Customer, tool: str, args: dict) -> dict:
 def check(cust: Customer, challenge_id: str, code: str) -> dict:
     """Check what the customer typed. Three wrong tries and the code is dead."""
     now = time.time()
-    with _LOCK, _db() as con:
+    with _db(cust) as con:
         row = con.execute("SELECT salt, code_hash, expires, attempts, verified, used FROM challenges"
                           " WHERE id=? AND customer=?", (challenge_id, cust.username)).fetchone()
         if row is None:
@@ -239,10 +234,11 @@ def check(cust: Customer, challenge_id: str, code: str) -> dict:
 def consume(cust: Customer, tool: str, args: dict) -> bool:
     """Called by the MCP tool just before it acts: uses up one confirmed code for exactly this action."""
     now = time.time()
-    with _LOCK, _db() as con:
+    with _db(cust) as con:
+        # "AND used IS NULL" twice: the outer one also holds if another server used it a moment ago.
         cur = con.execute(
-            "UPDATE challenges SET used=? WHERE id=(SELECT id FROM challenges WHERE customer=? AND fingerprint=?"
-            " AND verified IS NOT NULL AND used IS NULL AND expires>? ORDER BY verified DESC LIMIT 1)",
+            "UPDATE challenges SET used=? WHERE used IS NULL AND id=(SELECT id FROM challenges WHERE customer=?"
+            " AND fingerprint=? AND verified IS NOT NULL AND used IS NULL AND expires>? ORDER BY verified DESC LIMIT 1)",
             (now, cust.username, fingerprint(tool, args), now))
         return cur.rowcount == 1
 
@@ -283,8 +279,13 @@ async def _check(request: Request) -> JSONResponse:
     return await _handle(request, lambda cust, b: check(cust, str(b["challenge_id"]), str(b["code"])))
 
 
+async def _health(request: Request) -> JSONResponse:
+    return JSONResponse({"ok": True})
+
+
 app = Starlette(routes=[Route("/verify/start", _start, methods=["POST"]),
-                        Route("/verify/check", _check, methods=["POST"])])
+                        Route("/verify/check", _check, methods=["POST"]),
+                        Route("/healthz", _health)])  # for Docker / AWS health checks
 
 
 def summary() -> str:

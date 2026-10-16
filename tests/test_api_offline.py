@@ -1,8 +1,10 @@
-"""Offline end-to-end test of the web API (phase 4, step 1).
+"""Offline end-to-end test of the web API (phase 4).
 
 Real API + real MCP servers + the fixed eval bank, with a scripted model. No keys or network.
 
-    python tests/test_api_offline.py
+    python tests/test_api_offline.py                       # records in SQLite files
+    $env:TEST_DATABASE_URL="postgresql://bank:bank-local-only@localhost:5432/bank"
+    python tests/test_api_offline.py                       # the same checks on Postgres (own scratch schema)
 """
 
 from __future__ import annotations
@@ -26,6 +28,15 @@ os.environ.update({"BANK_TEST": "1", "LANGSMITH_TRACING": "false", "EVAL_PORT_OF
                    "OTP_OUTBOX": str(TMP / "outbox.jsonl"), "OBP_FAKE": "1", "AUTH_MODE": "dev",
                    "SESSION_DB": str(TMP / "sessions.db"), "VERIFY_URL": f"http://127.0.0.1:{8104 + OFFSET}"})
 
+PG_BASE = os.environ.get("TEST_DATABASE_URL", "").strip()
+DROP_PG = None
+if PG_BASE:  # API, conversation store and bank servers all on Postgres, in a throwaway schema
+    from tests.pg_scratch import scratch_url  # noqa: E402
+    PG_URL, DROP_PG = scratch_url(PG_BASE)
+    os.environ.update({"DATABASE_URL": PG_URL, "EVAL_DATABASE_URL": PG_URL})
+else:
+    os.environ.update({"DATABASE_URL": "", "EVAL_DATABASE_URL": ""})
+
 from evals import harness  # noqa: E402
 
 harness.configure_env()
@@ -36,6 +47,7 @@ from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage  # noqa: E402
 
 import api.app as api_module  # noqa: E402
+import storage  # noqa: E402
 from evals import fixture  # noqa: E402
 from guardrails.middleware import BLOCKED_SECRET_REPLY  # noqa: E402
 
@@ -73,7 +85,11 @@ SCRIPT = iter([
     call("transfer_between_my_accounts", from_account="current", to_account="savings", amount=20),
     AIMessage(content="The customer declined."),
     AIMessage(content="You chose not to go ahead, so I haven't made the transfer."),
+    # cheque book: waits on its slip while the server restarts
+    call("task", subagent_type="service-agent", description="Order a cheque book for the current account."),
+    call("request_cheque_book", account="current"),
 ])
+AFTER_RESTART = [AIMessage(content="Cheque book ordered."), AIMessage(content="Your cheque book is on its way.")]
 
 
 def latest_code() -> str:
@@ -88,10 +104,19 @@ async def balance(token, account):
     return json.loads(out[0]["text"] if isinstance(out, list) else out)["balance"]
 
 
+async def service_requests(token):
+    from agents.coordinator import load_mcp_tools
+    tools = {t.name: t for t in (await load_mcp_tools(token))["service"]}
+    out = await tools["list_my_service_requests"].ainvoke({})
+    return json.loads(out[0]["text"] if isinstance(out, list) else out)["requests"]
+
+
 async def main() -> int:
+    print(f"Records: {storage.describe()}")
     app = api_module.create_app(model_factory=lambda: Fake(messages=SCRIPT))
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://bank.test") as a, \
+    async with app.router.lifespan_context(app), \
+            httpx.AsyncClient(transport=transport, base_url="http://bank.test") as a, \
             httpx.AsyncClient(transport=transport, base_url="http://bank.test") as b:
         cfg = (await a.get("/api/config")).json()
         check("sign-in options list the demo customers", [c["name"] for c in cfg["customers"]] == ["Robert", "Anil"])
@@ -149,6 +174,30 @@ async def main() -> int:
               (await b.post("/api/confirm", json={"thread_id": thread, "approve": True})).status_code == 404)
         check("made-up thread ids are refused", (await a.get("/api/history?thread_id=A-../../x")).status_code == 404)
 
+        r = (await a.post("/api/chat", json={"message": "Order a cheque book for my current account",
+                                             "thread_id": thread})).json()
+        check("cheque book waits on its slip", r["status"] == "needs_confirmation"
+              and r["slip"]["title"] == "Order a cheque book")
+        before_restart = len(await service_requests("fake-token-A"))
+
+        # Restart: a new app has no sessions, but the conversation store still has everything.
+        app2 = api_module.create_app(model_factory=lambda: Fake(messages=iter(AFTER_RESTART)))
+        async with app2.router.lifespan_context(app2), \
+                httpx.AsyncClient(transport=httpx.ASGITransport(app=app2), base_url="http://bank.test") as a2:
+            check("after a restart: signed out", (await a2.get("/api/me")).status_code == 401)
+            await a2.post("/api/login", json={"customer": "A"})
+            hist = (await a2.get(f"/api/history?thread_id={thread}")).json()
+            texts = " ".join(m["text"] for m in hist["messages"])
+            check("after a restart: the conversation comes back", "5,234.77" in texts)
+            check("after a restart: the waiting slip comes back",
+                  (hist["slip"] or {}).get("title") == "Order a cheque book")
+            busy = await a2.post("/api/chat", json={"message": "hello?", "thread_id": thread})
+            check("after a restart: still can't chat past the slip", busy.status_code == 409)
+            r = (await a2.post("/api/confirm", json={"thread_id": thread, "approve": True})).json()
+            reqs = await service_requests("fake-token-A")
+            check("after a restart: approving it orders the cheque book", r["status"] == "answered"
+                  and len(reqs) == before_restart + 1 and reqs[0]["type"] == "cheque_book")
+
         page = await a.get("/")
         check("chat page served", page.status_code == 200 and "Demo Bank" in page.text)
         check("security headers set", "frame-ancestors 'none'" in page.headers.get("content-security-policy", "")
@@ -169,7 +218,9 @@ async def main() -> int:
 if __name__ == "__main__":
     servers = harness.start_servers()
     try:
-        code = asyncio.run(main())
+        code = asyncio.run(main(), loop_factory=storage.loop_factory())
     finally:
         harness.stop_servers(servers)
+        if DROP_PG:
+            DROP_PG()
     sys.exit(code)

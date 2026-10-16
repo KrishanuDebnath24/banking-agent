@@ -3,22 +3,20 @@
     meter = start_turn(thread_id, customer)          # before the agent runs
     config["callbacks"] = [CostCallback(meter)]       # sees every model call, subagents included
     ...agent runs; guardrails add their checks to the same meter...
-    end_turn(meter)                                   # saves to telemetry.db
+    end_turn(meter)                                   # saves to the ledger
     print(meter.summary_line())
 
-The ledger (SQLite, TELEMETRY_DB) is the bank's own record, independent of LangSmith,
-so cost reports keep working if tracing is off. On AWS it becomes a table in RDS or a
-CloudWatch metric.
+The ledger is the bank's own record, independent of LangSmith, so cost reports keep working
+if tracing is off. It lives in Postgres when DATABASE_URL is set (Docker, AWS), else in the
+SQLite file TELEMETRY_DB. TELEMETRY_DB=off turns it off.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import time
 import uuid
-from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -26,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
+
+from storage import LEDGER
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -205,34 +205,25 @@ class CostCallback(BaseCallbackHandler):
 
 # ---------- ledger ----------
 
-class Ledger:
-    def __init__(self, path: str | None = None):
-        self.path = path or os.environ.get("TELEMETRY_DB") or str(ROOT / "telemetry.db")
+_TURN_COLUMNS = ("ts", "turn_id", "thread_id", "customer", "model_calls", "tokens", "llm_cost_usd",
+                 "guard_cost_usd", "total_cost_usd", "latency_ms", "guard_notes")
+_SAVE_TURN = (f"INSERT INTO turns ({', '.join(_TURN_COLUMNS)}) VALUES ({', '.join('?' * len(_TURN_COLUMNS))})"
+              " ON CONFLICT (turn_id) DO UPDATE SET "
+              + ", ".join(f"{c}=excluded.{c}" for c in _TURN_COLUMNS if c != "turn_id"))
 
-    @contextmanager
-    def _db(self):
-        con = sqlite3.connect(self.path, timeout=10)
-        try:
-            con.executescript("""
-                CREATE TABLE IF NOT EXISTS turns (ts TEXT, turn_id TEXT PRIMARY KEY, thread_id TEXT, customer TEXT,
-                    model_calls INT, tokens INT, llm_cost_usd REAL, guard_cost_usd REAL, total_cost_usd REAL,
-                    latency_ms INT, guard_notes TEXT);
-                CREATE TABLE IF NOT EXISTS llm_calls (ts TEXT, turn_id TEXT, thread_id TEXT, customer TEXT, agent TEXT,
-                    model TEXT, input_tokens INT, output_tokens INT, cache_read INT, cache_write INT, cost_usd REAL);
-                CREATE TABLE IF NOT EXISTS guard_checks (ts TEXT, turn_id TEXT, thread_id TEXT, customer TEXT,
-                    layer TEXT, source TEXT, mode TEXT, findings TEXT, applied INT, units TEXT, cost_usd REAL,
-                    latency_ms INT, error TEXT);""")
-            yield con
-            con.commit()
-        finally:
-            con.close()
+
+class Ledger:
+    """The turns, llm_calls and guard_checks tables (see storage.LEDGER)."""
+
+    @property
+    def where(self) -> str:
+        return LEDGER.where
 
     def save(self, m: TurnMeter) -> None:
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        with self._db() as con:
-            con.execute("INSERT OR REPLACE INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                        (ts, m.turn_id, m.thread_id, m.customer, len(m.llm_calls), m.tokens, m.llm_cost,
-                         m.guard_cost, m.total_cost, m.latency_ms, json.dumps(m.guard_notes())))
+        with LEDGER.connect() as con:
+            con.execute(_SAVE_TURN, (ts, m.turn_id, m.thread_id, m.customer, len(m.llm_calls), m.tokens, m.llm_cost,
+                                     m.guard_cost, m.total_cost, m.latency_ms, json.dumps(m.guard_notes())))
             con.executemany("INSERT INTO llm_calls VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                             [(ts, m.turn_id, m.thread_id, m.customer, c["agent"], c["model"], c["input_tokens"],
                               c["output_tokens"], c["cache_read"], c["cache_write"], c["cost_usd"])
@@ -243,5 +234,5 @@ class Ledger:
                               g["cost_usd"], g["latency_ms"], g["error"]) for g in m.guard_checks])
 
     def query(self, sql: str, params: tuple = ()) -> list[tuple]:
-        with self._db() as con:
+        with LEDGER.connect() as con:
             return con.execute(sql, params).fetchall()

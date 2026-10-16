@@ -52,7 +52,10 @@ def start_servers() -> subprocess.Popen:
             "or set EVAL_PORT_OFFSET=350 in .env.")
     env = {**os.environ, "BANK_TEST": "1", "OBP_FAKE": "1", "OBP_FAKE_FIXTURE": os.environ["EVAL_FIXTURE"],
            "DEMO_ACCOUNTS_FILE": os.environ["EVAL_DEMO"], "MCP_PORT_OFFSET": str(PORT_OFFSET),
-           "SERVICE_REQUESTS_FILE": str(work / "requests.jsonl"), "OTP_DB": str(work / "otp.db"),
+           "SERVICE_REQUESTS_DB": str(work / "requests.db"), "OTP_DB": str(work / "otp.db"),
+           "SERVICE_REQUESTS_FILE": str(work / "none.jsonl"),  # don't copy in your own old requests
+           # The eval bank's records stay in this run's own SQLite files, never in your Postgres.
+           "DATABASE_URL": os.environ.get("EVAL_DATABASE_URL", ""),
            "EMAIL_BACKEND": "console", "LANGSMITH_TRACING": "false",
            "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", "EVAL_SERVER_PROCESS": "1"}  # log lines appear at once, £ never breaks
     log_path = work / "servers.log"

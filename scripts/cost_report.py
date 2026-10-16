@@ -1,4 +1,4 @@
-"""Cost report from the ledger (telemetry.db), written by the chat after every turn.
+"""Cost report from the ledger (Postgres or telemetry.db), written by the chat after every turn.
 
     python -m scripts.cost_report              # last 7 days
     python -m scripts.cost_report --days 30
@@ -41,7 +41,7 @@ def main() -> int:
     since = (datetime.now(timezone.utc) - timedelta(days=args.days)).isoformat(timespec="seconds")
     q = ledger.query
     turns = q("SELECT total_cost_usd, latency_ms FROM turns WHERE ts >= ?", (since,))
-    print(f"Cost report, last {args.days} days  (ledger: {ledger.path})")
+    print(f"Cost report, last {args.days} days  (ledger: {ledger.where})")
     if not turns:
         print("No turns recorded yet. Chat with  python -m scripts.chat_multi  first.")
         return 0

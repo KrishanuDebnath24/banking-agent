@@ -38,7 +38,8 @@ DEMO.write_text(json.dumps({"bank_id": "gh.29.uk", "customers": {
 TEST_ENV = {"BANK_TEST": "1", "TELEMETRY_DB": "off", "MCP_PORT_OFFSET": "200",  # own ports: 8301-8304
             "MCP_ACCOUNTS_URL": "http://127.0.0.1:8301/mcp", "MCP_TRANSACTIONS_URL": "http://127.0.0.1:8302/mcp",
             "MCP_SERVICE_URL": "http://127.0.0.1:8303/mcp", "VERIFY_URL": "http://127.0.0.1:8304", "OBP_FAKE": "1", "DEMO_ACCOUNTS_FILE": str(DEMO),
-            "SERVICE_REQUESTS_FILE": str(TMP / "requests.jsonl"), "LANGSMITH_TRACING": "false",
+            "SERVICE_REQUESTS_FILE": str(TMP / "requests.jsonl"), "SERVICE_REQUESTS_DB": str(TMP / "requests.db"),
+            "DATABASE_URL": "", "LANGSMITH_TRACING": "false",
             "EMAIL_BACKEND": "console", "OTP_OUTBOX": str(OUTBOX), "OTP_DB": str(TMP / "verification.db"),
             "OTP_TRANSFER_THRESHOLD": "100", "OTP_EMAIL_TO": "me@demo.test"}
 ENV = {**os.environ, **TEST_ENV}
@@ -57,6 +58,15 @@ from scripts.chat_multi import CODE_NOT_CONFIRMED, security_code  # noqa: E402
 class Fake(GenericFakeChatModel):
     def bind_tools(self, tools, **kw):
         return self
+
+
+def service_requests() -> list[dict]:
+    """Every service request the servers saved, oldest first (from the service_requests table)."""
+    import storage
+    with storage.REQUESTS.connect() as db:
+        rows = db.execute("SELECT reference, type, status, bank_message FROM service_requests"
+                          " ORDER BY created_ts").fetchall()
+    return [dict(zip(("reference", "type", "status", "bank_message"), r)) for r in rows]
 
 
 def call(name, **args):
@@ -252,7 +262,7 @@ async def main() -> int:
         AIMessage(content="Address changed."), AIMessage(content="Your address is updated.")],
         "change my address", approve_with_code())
     profile = await tool("fake-token-A", "service", "get_my_profile")
-    reqs = [json.loads(line) for line in (TMP / "requests.jsonl").read_text().splitlines()]
+    reqs = service_requests()
     check("address change pauses for approval", pending == ["change_address"])
     check("new address is saved at the bank (profile reads it back)", profile.get("address") == new_address)
     check("address change logged as completed with a reference", reqs[-1]["type"] == "address_change"
@@ -284,7 +294,7 @@ async def main() -> int:
         state = await agent.aget_state(cfg)
         check("pending confirmation restored after restart", len(state.interrupts) == 1)
         await agent.ainvoke(Command(resume={"decisions": [{"type": "approve"}]}), cfg)
-        reqs = [json.loads(line) for line in (TMP / "requests.jsonl").read_text().splitlines()]
+        reqs = service_requests()
         check("resumed cheque book request completes", reqs[-1]["type"] == "cheque_book")
 
     # 11. Another customer's account is refused by the server itself, whatever the model asks.

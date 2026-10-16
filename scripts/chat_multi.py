@@ -11,7 +11,8 @@ Then:
 Transfers and service requests stop and ask you to confirm (y/n) before they run.
 Address changes and larger transfers then ask for the security code emailed to you;
 the code goes straight to the bank's verify service, never to the AI.
-Conversations, including any pending confirmation, are saved in sessions.db.
+Conversations, including any pending confirmation, are saved in sessions.db
+(or in Postgres when DATABASE_URL is set).
 """
 
 from __future__ import annotations
@@ -23,16 +24,15 @@ import re
 import uuid
 
 import httpx
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from scripts._common import ROOT, login, setup
+from scripts._common import load_env, login, setup
+import storage
 from agents.coordinator import build_coordinator
 from agents.llm import model_spec
 from guardrails.bedrock import BedrockGuard
 from observability import costs
 
-SESSION_DB = os.environ.get("SESSION_DB", str(ROOT / "sessions.db"))
 CODE_NOT_CONFIRMED = "The security code was not confirmed, so nothing was done."
 
 
@@ -174,7 +174,7 @@ async def main() -> int:
               "metadata": {"customer": args.customer, "thread_id": thread_id,
                            "guardrail_mode": bedrock.mode if bedrock else "rules-only"}}
 
-    async with AsyncSqliteSaver.from_conn_string(SESSION_DB) as saver:
+    async with storage.checkpointer() as saver:
         try:
             agent = await build_coordinator(token, saver)
         except Exception as e:  # noqa: BLE001
@@ -220,7 +220,8 @@ async def main() -> int:
 
 if __name__ == "__main__":
     try:
-        code = asyncio.run(main())
+        load_env()
+        code = asyncio.run(main(), loop_factory=storage.loop_factory())
     except KeyboardInterrupt:  # Ctrl+C: leave quietly, the conversation is already saved
         print("\nBye. Your conversation is saved; continue it with --thread.")
         from langchain_core.tracers.langchain import wait_for_all_tracers

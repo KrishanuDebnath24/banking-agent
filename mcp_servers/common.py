@@ -46,6 +46,20 @@ PORTS = {"accounts": 8101 + _OFFSET, "transactions": 8102 + _OFFSET, "service": 
          "verify": 8104 + _OFFSET}  # verify: security codes (plain HTTP, not MCP)
 
 
+def transport_security():
+    """Which addresses the MCP servers answer to.
+
+    The MCP library only accepts requests addressed to 127.0.0.1 / localhost by default (protection
+    against DNS rebinding). In Docker the web chat calls the servers by their service name ("mcp"),
+    so MCP_ALLOWED_HOSTS adds names to that list; the protection itself stays on."""
+    from mcp.server.transport_security import TransportSecuritySettings
+    extra = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    names = ["127.0.0.1", "localhost", "[::1]", *extra]
+    return TransportSecuritySettings(enable_dns_rebinding_protection=True,
+                                     allowed_hosts=[f"{n}:*" for n in names],
+                                     allowed_origins=[f"http://{n}:*" for n in names])
+
+
 @dataclass
 class Customer:
     label: str
@@ -169,5 +183,5 @@ def rows_for(cust: Customer, raw: list[dict], from_date: str | None, to_date: st
     return rows
 
 
-__all__ = ["CLIENT", "PORTS", "Customer", "OBPError", "bank", "customer", "customer_for_token", "error",
+__all__ = ["CLIENT", "PORTS", "Customer", "transport_security", "OBPError", "bank", "customer", "customer_for_token", "error",
            "parse_date", "rows_for", "token_from_header"]

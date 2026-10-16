@@ -10,9 +10,11 @@ from collections import defaultdict
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from mcp_servers.common import CLIENT, PORTS, OBPError, bank, customer, error, parse_date, rows_for
+from mcp_servers.common import (CLIENT, PORTS, OBPError, bank, customer, error, parse_date, rows_for,
+                                 transport_security)
 
 mcp = FastMCP("transactions", port=PORTS["transactions"], stateless_http=True, json_response=True,
+              transport_security=transport_security(),
               instructions="Transaction history, spending summaries and statements for the logged-in customer.")
 
 

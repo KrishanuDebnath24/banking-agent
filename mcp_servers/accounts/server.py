@@ -11,10 +11,11 @@ import json
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from mcp_servers.common import CLIENT, PORTS, OBPError, bank, customer, error
+from mcp_servers.common import CLIENT, PORTS, OBPError, bank, customer, error, transport_security
 from mcp_servers.verification import TRANSFER, VERIFICATION_REQUIRED, consume, needs_code
 
 mcp = FastMCP("accounts", port=PORTS["accounts"], stateless_http=True, json_response=True,
+              transport_security=transport_security(),
               instructions="Balances and transfers between the logged-in customer's own accounts.")
 
 

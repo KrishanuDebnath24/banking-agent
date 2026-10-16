@@ -220,6 +220,56 @@ Terminal 1: `python -m mcp_servers.run`   Terminal 2: `python -m api`   Then ope
 
 Offline test (no keys): `python tests/test_api_offline.py`
 
+## 9. Phase 4, step 2: Postgres and Docker
+
+On AWS the app runs in containers, and files inside a container vanish when it restarts. So
+everything the app saves now goes into one Postgres database when `DATABASE_URL` is set:
+conversations (with any slip waiting for approval), security codes, service requests and the
+cost ledger. Without `DATABASE_URL` nothing changes: SQLite files, as before. Requests from the old
+`service_requests.jsonl` are copied into the database once, on first use.
+
+**Install Docker Desktop** (free for personal use): https://docs.docker.com/desktop/setup/install/windows-install/
+Use the WSL 2 option it suggests, restart, and open Docker Desktop once so it's running.
+
+**Run the whole app in Docker**, the way AWS will run it (Postgres + bank servers + web chat):
+
+```powershell
+docker compose up --build          # first build takes a few minutes
+# open http://127.0.0.1:8000
+docker compose logs -f mcp         # in another terminal: security codes appear here (EMAIL_BACKEND=console)
+docker compose down                # stop; conversations stay in the database (down -v deletes it)
+```
+
+Stop `python -m api` / `python -m mcp_servers.run` first if they're running (same ports).
+Docker reads your `.env`, with three things to know:
+- Model: Docker can't see `aws configure` credentials. With `MODEL=bedrock_converse:...`, put a Bedrock
+  API key in `AWS_BEARER_TOKEN_BEDROCK`, or use `MODEL=anthropic:...` with `ANTHROPIC_API_KEY`. (On AWS the
+  container gets credentials from its role.) Same for the Bedrock guardrail: without credentials it is
+  skipped and logged, never blocking.
+- A value containing `$` needs single quotes in `.env`: `PASSWORD='ab$cd'`.
+- `demo_accounts.json` and `seed_log.jsonl` are copied into the image; `.env` never is.
+
+**Or keep running Python on your PC with Postgres from Docker:**
+
+```powershell
+docker compose up -d db
+# in .env:  DATABASE_URL=postgresql://bank:bank-local-only@localhost:5432/bank
+python -m mcp_servers.run          # both say "Records: Postgres bank@localhost:5432/bank"
+python -m api
+```
+
+Look inside the database: `docker compose exec db psql -U bank -d bank -c "\dt"`
+
+**Tests on Postgres** (with `docker compose up -d db` running; each run uses its own throwaway schema):
+
+```powershell
+python tests/test_storage.py                    # SQLite only
+$env:TEST_DATABASE_URL="postgresql://bank:bank-local-only@localhost:5432/bank"
+python tests/test_storage.py                    # SQLite, then the same checks on Postgres
+python tests/test_api_offline.py                # the web API end to end on Postgres
+Remove-Item Env:TEST_DATABASE_URL
+```
+
 ## Layout
 
 ```
@@ -252,7 +302,7 @@ guardrails/pii.py              deterministic PII detection and masking
 guardrails/middleware.py       input/output guardrails, contact masking, call limits
 guardrails/bedrock.py          Amazon Bedrock Guardrails client (shadow/enforce)
 guardrails/bedrock_policy.py   the Bedrock guardrail, as code
-observability/costs.py         per-turn cost meter and the telemetry.db ledger
+observability/costs.py         per-turn cost meter and the ledger
 observability/tracing.py       PII redaction for LangSmith traces
 scripts/setup_guardrail.py     create/update the Bedrock guardrail
 scripts/cost_report.py         cost report from the ledger
@@ -268,4 +318,9 @@ api/app.py                     web API: sessions, chat, confirmations with codes
 api/actions.py                 what each action looks like on the confirmation slip
 web/                           the chat page (index.html, app.css, app.js)
 tests/test_api_offline.py      the web API end to end, with a scripted model
+storage/__init__.py            where records go: Postgres (DATABASE_URL) or SQLite files
+tests/test_storage.py          every kind of record, on SQLite and Postgres
+tests/pg_scratch.py            a throwaway Postgres schema per test run
+Dockerfile                     one image: web chat (default) or bank servers
+docker-compose.yml             Postgres + bank servers + web chat on your PC
 ```

@@ -4,7 +4,8 @@
                                               # + the security code service (8104)
     python -m mcp_servers.run --only service  # just one, e.g. to run them in separate terminals
 
-Leave it running while you chat. Servers listen on 127.0.0.1 only.
+Leave it running while you chat. Servers listen on 127.0.0.1 only (MCP_HOST changes that; Docker
+sets it so the web chat container can reach them).
 Set OBP_FAKE=1 to use the built-in fake bank instead of the OBP sandbox.
 """
 
@@ -28,6 +29,7 @@ MODULES = {
 
 
 async def serve(names: list[str]) -> None:
+    host = os.environ.get("MCP_HOST", "127.0.0.1")
     servers = []
     for name in names:
         module = importlib.import_module(MODULES[name])
@@ -35,14 +37,16 @@ async def serve(names: list[str]) -> None:
             app, path = module.app, "/verify"
         else:
             app, path = module.mcp.streamable_http_app(), "/mcp"
-        config = uvicorn.Config(app, host="127.0.0.1", port=PORTS[name], log_level="warning")
+        config = uvicorn.Config(app, host=host, port=PORTS[name], log_level="warning")
         servers.append(uvicorn.Server(config))
-        print(f"  {name:<13} http://127.0.0.1:{PORTS[name]}{path}")
+        print(f"  {name:<13} http://{host}:{PORTS[name]}{path}")
     print("Bank: " + ("FAKE (OBP_FAKE=1)" if os.environ.get("OBP_FAKE") == "1" else "OBP sandbox")
           + ". Press Ctrl+C to stop.")
     if "verify" in names:
         from mcp_servers.verification import summary
         print(summary())
+    import storage
+    print(f"Records: {storage.describe()}")
     await asyncio.gather(*(s.serve() for s in servers))
 
 
