@@ -9,6 +9,8 @@ What is kept:
     security codes     challenges                          OTP              SQLite file: OTP_DB
     service requests   service_requests                    REQUESTS         SQLite file: SERVICE_REQUESTS_DB
     cost ledger        turns, llm_calls, guard_checks      LEDGER           SQLite file: TELEMETRY_DB
+    visitors' banks    guest_customers, guest_accounts...  GUESTS           SQLite file: GUEST_DB
+    web chat state     web_sessions, chat_turns, chat_pending, signin_codes   WEB   SQLite file: WEB_DB
 
 The SQL in this project is written once for both databases: ? placeholders, plain types
 (TEXT, INTEGER, DOUBLE PRECISION) and ON CONFLICT for upserts. Tables are created on first use,
@@ -211,6 +213,51 @@ LEDGER = Store("cost ledger", "TELEMETRY_DB", "telemetry.db", """
     CREATE INDEX IF NOT EXISTS turns_ts ON turns (ts);
     CREATE INDEX IF NOT EXISTS llm_calls_ts ON llm_calls (ts);
     CREATE INDEX IF NOT EXISTS guard_checks_ts ON guard_checks (ts)
+""")
+
+
+GUESTS = Store("guest banks", "GUEST_DB", "guest_banks.db", """
+    CREATE TABLE IF NOT EXISTS guest_customers (
+        guest_id TEXT PRIMARY KEY, email TEXT NOT NULL, name TEXT NOT NULL, verified INTEGER NOT NULL,
+        ip_hash TEXT, created DOUBLE PRECISION NOT NULL, expires DOUBLE PRECISION NOT NULL);
+    CREATE INDEX IF NOT EXISTS guest_customers_email ON guest_customers (email, expires);
+    CREATE INDEX IF NOT EXISTS guest_customers_ip ON guest_customers (ip_hash, created);
+    CREATE TABLE IF NOT EXISTS guest_accounts (
+        account_id TEXT PRIMARY KEY, guest_id TEXT NOT NULL, role TEXT NOT NULL,
+        balance DOUBLE PRECISION NOT NULL, currency TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS guest_accounts_guest ON guest_accounts (guest_id);
+    CREATE TABLE IF NOT EXISTS guest_transactions (
+        txn_id TEXT PRIMARY KEY, guest_id TEXT NOT NULL, account_id TEXT NOT NULL, completed TEXT NOT NULL,
+        seq DOUBLE PRECISION NOT NULL, description TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
+        balance_after DOUBLE PRECISION NOT NULL);
+    CREATE INDEX IF NOT EXISTS guest_transactions_account ON guest_transactions (account_id, seq);
+    CREATE INDEX IF NOT EXISTS guest_transactions_guest ON guest_transactions (guest_id);
+    CREATE TABLE IF NOT EXISTS guest_attributes (
+        guest_id TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, inserted TEXT NOT NULL,
+        PRIMARY KEY (guest_id, name));
+    CREATE TABLE IF NOT EXISTS guest_messages (guest_id TEXT NOT NULL, ts TEXT NOT NULL, message TEXT NOT NULL)
+""")
+
+WEB = Store("web chat state", "WEB_DB", "web.db", """
+    CREATE TABLE IF NOT EXISTS web_sessions (
+        sid_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, subject TEXT NOT NULL, owner_key TEXT NOT NULL,
+        email TEXT, name TEXT NOT NULL, created DOUBLE PRECISION NOT NULL, last_seen DOUBLE PRECISION NOT NULL);
+    CREATE INDEX IF NOT EXISTS web_sessions_owner ON web_sessions (owner_key);
+    CREATE TABLE IF NOT EXISTS chat_turns (
+        turn_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, owner_key TEXT NOT NULL, kind TEXT NOT NULL,
+        status TEXT NOT NULL, steps TEXT NOT NULL, result TEXT, created DOUBLE PRECISION NOT NULL,
+        updated DOUBLE PRECISION NOT NULL);
+    CREATE INDEX IF NOT EXISTS chat_turns_thread ON chat_turns (thread_id, created);
+    CREATE INDEX IF NOT EXISTS chat_turns_owner ON chat_turns (owner_key, created);
+    CREATE TABLE IF NOT EXISTS chat_pending (
+        thread_id TEXT PRIMARY KEY, owner_key TEXT NOT NULL, items TEXT NOT NULL, decisions TEXT NOT NULL,
+        challenge TEXT, updated DOUBLE PRECISION NOT NULL);
+    CREATE TABLE IF NOT EXISTS signin_codes (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL, ip_hash TEXT NOT NULL, salt TEXT NOT NULL, code_hash TEXT NOT NULL,
+        created DOUBLE PRECISION NOT NULL, expires DOUBLE PRECISION NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        used DOUBLE PRECISION);
+    CREATE INDEX IF NOT EXISTS signin_codes_email ON signin_codes (email, created);
+    CREATE INDEX IF NOT EXISTS signin_codes_ip ON signin_codes (ip_hash, created)
 """)
 
 

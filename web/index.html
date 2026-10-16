@@ -18,20 +18,61 @@
     </a>
     <div class="who" id="who" hidden>
       <span id="who-name"></span>
-      <button class="link" id="new-chat" type="button">New conversation</button>
+      <button class="link" id="new-chat" type="button"><span class="long">New conversation</span><span class="short">New chat</span></button>
+      <button class="link" id="reset-bank" type="button" title="New balances and activity; conversations cleared" hidden><span class="long">Start over</span><span class="short">Reset</span></button>
+      <button class="link" id="switch-customer" type="button" hidden><span class="long">Switch customer</span><span class="short">Switch</span></button>
       <button class="link" id="sign-out" type="button">Sign out</button>
     </div>
   </header>
 
   <main id="sign-in" class="sign-in" hidden>
-    <h1>Sign in to the demo</h1>
-    <p>Choose a demo customer. In the AWS version this is replaced by the bank's own sign-in.</p>
-    <div class="customers" id="customers"></div>
-    <p class="note">Demo Bank is fictional. Accounts and transactions come from a test bank.</p>
+    <h1>Try the banking assistant</h1>
+    <p>Sign in and you get a pretend bank of your own: a current and a savings account with two months of
+      everyday spending. Ask about it, move money, change your address. Nothing is real money.</p>
+    <section class="visitor-form" id="public-signin" hidden>
+      <a class="google-button" id="google-button" href="/api/auth/google" hidden>Continue with Google</a>
+      <p class="or" id="or-divider" hidden><span>or</span></p>
+      <form id="email-form" class="stack" novalidate>
+        <label for="signin-email">Email</label>
+        <input id="signin-email" type="email" autocomplete="email" maxlength="254" required>
+        <button type="submit" id="email-go">Email me a sign-in code</button>
+      </form>
+      <form id="code-form" class="stack" novalidate hidden>
+        <label for="signin-code" id="signin-code-label"></label>
+        <input id="signin-code" class="code-input" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*" maxlength="6" required>
+        <div class="row">
+          <button type="submit" id="code-go">Sign in</button>
+          <button type="button" class="text-button" id="code-restart">Use a different email</button>
+        </div>
+      </form>
+      <p class="form-note" id="public-note" aria-live="polite"></p>
+    </section>
+    <form class="visitor-form" id="visitor-form" novalidate hidden>
+      <label for="visitor-email">Email</label>
+      <input id="visitor-email" type="email" autocomplete="email" maxlength="254" required>
+      <label for="visitor-name">First name <span class="optional">(optional)</span></label>
+      <input id="visitor-name" type="text" autocomplete="given-name" maxlength="40">
+      <p class="form-note" id="visitor-note" aria-live="polite"></p>
+      <button type="submit" id="visitor-go">Open my demo bank</button>
+    </form>
+    <p class="note"><span id="visitor-terms"></span> <a href="/privacy.html">Privacy notice</a></p>
+    <section class="owners" id="owners" hidden>
+      <h2>Owner's demo customers</h2>
+      <p>The two customers in the Open Bank Project sandbox.</p>
+      <div class="customers" id="customers"></div>
+    </section>
+  </main>
+
+  <main id="choose" class="sign-in" hidden>
+    <h1 id="choose-title">Welcome back</h1>
+    <p>Choose a demo customer: the two customers in the Open Bank Project sandbox.</p>
+    <div class="customers" id="choose-customers"></div>
+    <p class="form-note" id="choose-note" aria-live="polite"></p>
   </main>
 
   <main id="chat" class="chat" hidden>
     <section class="conversation" aria-label="Conversation">
+      <p class="notice" id="notice" hidden></p>
       <div class="log" id="log" aria-live="polite">
         <div class="empty" id="empty">
           <h1>How can I help?</h1>

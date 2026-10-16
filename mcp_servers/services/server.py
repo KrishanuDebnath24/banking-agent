@@ -11,6 +11,7 @@ bank's case system. The bank is also sent a customer message for each one.
 
 Requests are kept in the service_requests table (Postgres if DATABASE_URL is set, else a SQLite
 file). Requests logged before that, in service_requests.jsonl, are copied in once on first use.
+Visitors' requests are filed under guest:<id> and deleted along with their pretend bank.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from mcp_servers.common import CLIENT, PORTS, ROOT, OBPError, bank, customer, error, transport_security
+from mcp_servers.common import PORTS, ROOT, OBPError, bank, customer, error, transport_security
 from mcp_servers.verification import ADDRESS, ADDRESS_MAX, VERIFICATION_REQUIRED, consume
 from storage import REQUESTS
 
@@ -46,7 +47,7 @@ NEXT_STEPS = {
 def _new_record(cust, kind: str, details: dict, status: str) -> dict:
     return {"reference": "SR-" + secrets.token_hex(3).upper(),
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "customer": cust.label, "username": cust.username, "type": kind, "details": details,
+            "customer": cust.label, "username": cust.records_key, "type": kind, "details": details,
             "status": status}
 
 
@@ -104,7 +105,7 @@ async def _log(record: dict) -> None:
 
 async def _customer_id(cust) -> str | None:
     try:
-        records = await bank(CLIENT.my_customers, cust.token, cust.bank_id)
+        records = await bank(cust.obp.my_customers, cust.token, cust.bank_id)
         return records[0].get("customer_id") if records else None
     except OBPError:
         return None
@@ -116,7 +117,7 @@ async def _message_bank(cust, text: str) -> str:
     if not cid:
         return "not sent (no customer record at the bank)"
     try:
-        await bank(CLIENT.create_customer_message, cust.token, cust.bank_id, cid, text)
+        await bank(cust.obp.create_customer_message, cust.token, cust.bank_id, cid, text)
         return "sent"
     except OBPError as e:
         return f"not sent (HTTP {e.status})"
@@ -152,11 +153,11 @@ async def get_my_profile(ctx: Context) -> str:
     and the address on file."""
     cust = await customer(ctx)
     try:
-        records = await bank(CLIENT.my_customers, cust.token, cust.bank_id)
+        records = await bank(cust.obp.my_customers, cust.token, cust.bank_id)
     except OBPError:
         records = []
     try:
-        attrs = await bank(CLIENT.my_user_attributes, cust.token)
+        attrs = await bank(cust.obp.my_user_attributes, cust.token)
         saved = next((a for a in attrs if a.get("name") == ADDRESS_ATTRIBUTE), None)
         address = saved.get("value") if saved else None
     except OBPError:
@@ -192,14 +193,14 @@ async def change_address(new_address: str, ctx: Context) -> str:
 
     record = _new_record(cust, "address_change", {"new_address": address}, "completed")
     try:
-        await bank(CLIENT.set_my_user_attribute, cust.token, ADDRESS_ATTRIBUTE, address)
+        await bank(cust.obp.set_my_user_attribute, cust.token, ADDRESS_ATTRIBUTE, address)
     except OBPError as e:
         record.update(status="failed", error=f"HTTP {e.status}")
         await _log(record)
         return error("bank_error", status=e.status, message="The bank did not save the new address; nothing changed.")
     # Read it back, so "saved" means the bank really holds it.
     try:
-        attrs = await bank(CLIENT.my_user_attributes, cust.token)
+        attrs = await bank(cust.obp.my_user_attributes, cust.token)
     except OBPError:
         attrs = []
     on_file = next((a.get("value") for a in attrs if a.get("name") == ADDRESS_ATTRIBUTE), None)
@@ -249,7 +250,7 @@ async def request_kyc_update(update: str, ctx: Context) -> str:
 async def list_my_service_requests(ctx: Context) -> str:
     """The customer's address changes and service requests so far, newest first, with reference and status."""
     cust = await customer(ctx)
-    return json.dumps({"requests": await asyncio.to_thread(requests_of, cust.username)})
+    return json.dumps({"requests": await asyncio.to_thread(requests_of, cust.records_key)})
 
 
 if __name__ == "__main__":

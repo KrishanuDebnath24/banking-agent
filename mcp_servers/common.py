@@ -1,10 +1,14 @@
 """Shared code for the three MCP servers.
 
-Identity comes only from the customer's OBP token, sent by the agent as an
-HTTP header on every MCP call. The server asks OBP who the token belongs to,
-then looks up that customer's allowed (visible) accounts in demo_accounts.json.
-Nothing the model writes can change who the customer is or which accounts
-they may touch.
+Identity comes only from the customer's bank token, sent by the agent as an
+HTTP header on every MCP call. Nothing the model writes can change who the
+customer is or which accounts they may touch. Two kinds of token:
+
+    the owner's demo customers (A, B)   an OBP token: OBP says who it belongs to, and their
+                                        accounts come from demo_accounts.json
+    visitors                            guest.<id>.<signature>: their own pretend bank in the
+                                        database (obp/guest_bank.py); the signature (APP_SECRET)
+                                        proves the web chat issued it
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -28,6 +33,8 @@ if os.environ.get("BANK_TEST") != "1":
 
 from agents.context import VISIBLE_ROLES, _first_seed_time, account_key  # noqa: E402
 from obp.client import OBPClient, OBPError  # noqa: E402
+from obp.guest_bank import BANK_ID as GUEST_BANK_ID  # noqa: E402
+from obp.guest_bank import GUEST_BANK  # noqa: E402
 
 DEMO_FILE = Path(os.environ.get("DEMO_ACCOUNTS_FILE", ROOT / "demo_accounts.json"))
 
@@ -62,13 +69,26 @@ def transport_security():
 
 @dataclass
 class Customer:
-    label: str
+    label: str                        # "A", "B", or "G" for a visitor
     username: str
     token: str = field(repr=False)
     bank_id: str
     currency: str
     accounts: dict[str, str]          # visible name -> account id
     show_since: str | None = None
+    client: Any = field(default=None, repr=False, compare=False)   # None: the OBP sandbox (CLIENT)
+    guest_id: str | None = None       # visitors only
+    email: str | None = None          # where security codes go, if the sign-in proved this address
+
+    @property
+    def obp(self):
+        """The bank this customer's accounts live in: the OBP sandbox, or the visitors' bank."""
+        return self.client or CLIENT
+
+    @property
+    def records_key(self) -> str:
+        """Whose service requests these are. A visitor's are deleted with their bank."""
+        return f"guest:{self.guest_id}" if self.guest_id else self.username
 
     def resolve(self, account: str | None) -> str | None:
         """ "current", "my current account", or this customer's own account id -> the id; else None."""
@@ -110,11 +130,30 @@ def token_from_header(auth: str) -> str:
     raise PermissionError("missing customer token")
 
 
+def _visitor(token: str) -> Customer:
+    try:
+        guest = GUEST_BANK.get(GUEST_BANK.verify(token))
+    except OBPError as e:
+        raise PermissionError("the bank did not accept this login; please sign in again") from e
+    if guest is None:
+        raise PermissionError("this demo bank has expired; please sign in again")
+    return Customer(label="G", username=guest.email, token=token, bank_id=GUEST_BANK_ID,
+                    currency=GUEST_BANK.currency, accounts=GUEST_BANK.accounts_of(guest.guest_id),
+                    client=GUEST_BANK, guest_id=guest.guest_id, email=guest.email if guest.verified else None)
+
+
 def _lookup(token: str) -> Customer:
     key = hashlib.sha256(token.encode()).hexdigest()
     hit = _CACHE.get(key)
     if hit and hit[1] > time.time():
         return hit[0]
+    if len(_CACHE) > 5000:  # many visitors: forget the stale entries
+        for k in [k for k, (_, until) in _CACHE.items() if until <= time.time()]:
+            _CACHE.pop(k, None)
+    if GUEST_BANK.is_guest_token(token):
+        cust = _visitor(token)
+        _CACHE[key] = (cust, time.time() + 60)   # short: a visitor's bank can be reset or expire
+        return cust
     try:
         username = CLIENT.current_user(token).get("username")
     except OBPError as e:

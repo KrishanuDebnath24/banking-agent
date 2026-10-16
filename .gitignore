@@ -11,3 +11,4 @@ telemetry.db
 evals/results/
 service_requests.db
 *.db-*
+*.db

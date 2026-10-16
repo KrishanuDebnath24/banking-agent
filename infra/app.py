@@ -1,9 +1,9 @@
 """The AWS setup as code (AWS CDK). Run the cdk commands from this folder:
 
     cdk deploy BankBudget      the budget alarm (free; keep it)
-    cdk diff BankApp           what the app would create, without creating anything
-    cdk deploy BankApp         create the app (phase 4, step 4)
-    cdk destroy BankApp        delete it after the demo
+    cdk diff BankApp           what the app would create or change, without doing it
+    cdk deploy BankApp         create or update the app (open OPEN_HOURS, 09:00-17:00 Irish time)
+    cdk destroy BankApp        delete it (visitors' banks go with the database; OBP data stays)
 
 Settings come from ../.env (see settings.py). Passwords and keys never do.
 """
@@ -26,6 +26,6 @@ if settings.budget_email:
 else:
     print("Note: BUDGET_EMAIL isn't set in .env, so the BankBudget stack is skipped.")
 BankStack(app, "BankApp", env=env, settings=settings,
-          description="banking-agent: web chat, bank servers and database for a demo")
+          description="banking-agent: the assistant on AWS, open during OPEN_HOURS")
 
 app.synth()

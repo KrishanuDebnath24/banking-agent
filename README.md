@@ -212,11 +212,13 @@ Terminal 1: `python -m mcp_servers.run`   Terminal 2: `python -m api`   Then ope
 
 | Endpoint | What it does |
 |---|---|
-| `POST /api/login` | demo sign-in `{customer: "A"}` (AUTH_MODE=dev only) |
-| `POST /api/chat` | `{message, thread_id?}` -> an answer, or a confirmation slip |
-| `POST /api/confirm` | `{thread_id, approve, code?}` -> code needed, wrong code, or the answer |
-| `GET /api/history` | a conversation's messages, and any slip still waiting |
-| `GET /healthz` | for the load balancer |
+| `POST /api/login` | dev sign-in: `{customer: "A"}` (owner) or `{email}` (visitor, step 4a) |
+| `POST /api/chat` | `{message, thread_id?}` -> 202 and a `turn_id`; the answer comes later |
+| `GET /api/turns/{turn_id}` | the answer so far: running (with live steps), answered, a slip, or failed |
+| `POST /api/confirm` | `{thread_id, approve, code?}` -> code needed, wrong code, next slip, or 202 and a `turn_id` |
+| `GET /api/history` | a conversation's messages, any slip still waiting, any answer still on its way |
+| `POST /api/guest/reset` | visitors: new balances and activity, conversations cleared |
+| `GET /healthz` | health checks (the container's own) |
 
 Offline test (no keys): `python tests/test_api_offline.py`
 
@@ -278,7 +280,7 @@ one deletes it, so it only exists (and costs) while you're demoing.
 | Stack | What it is | Cost |
 |---|---|---|
 | `BankBudget` | an email at 50%, 80% and 100% of $25 a month, and when the month is heading past it. Counts spending *before* credits, so it warns while credits are paying | free; keep it |
-| `BankApp` | network without a NAT gateway; the smallest Postgres (in subnets with no internet route); one Fargate task running the web chat and the bank servers side by side; a load balancer only your address can reach (`ALLOWED_CIDR`); logs kept a week | about $0.09 an hour while it exists, so a 3-hour demo costs about $0.30, a forgotten day about $2 |
+| `BankApp` | the app: CloudFront (https), API Gateway, one small Fargate task (web chat + bank servers), the smallest Postgres, open 09:00-17:00 Irish time. See section 13 | about $14 a month |
 
 Passwords and API keys never go into the templates: `python -m infra.app_secrets push` copies them
 from `.env` to AWS Secrets Manager, and the containers read them from there when they start.
@@ -303,9 +305,159 @@ cd ..
 ```
 
 **Checks without AWS** (also run on GitHub): `python infra/tests/test_stacks.py`. These build the
-templates and check, for example: no NAT gateway, database not public, only your address reaches the
-load balancer, no password in any template, and the AWS security checks (cdk-nag), where every
+templates and check, for example: no NAT gateway, database not public, the app only reachable through
+API Gateway and CloudFront, the opening hours, no password in any template, and the AWS security checks (cdk-nag), where every
 finding is either fixed or accepted with a written reason in `infra/stacks/bank.py`.
+
+## 11. Phase 4, step 4a: open to visitors
+
+Anyone with the link can try the assistant without touching the real sandbox: each visitor gets a
+**pretend bank of their own** (`obp/guest_bank.py`), kept in the same database as everything else.
+It has a current and a savings account, about two months of everyday activity (salary, rent,
+groceries, subscriptions) and an address, and it behaves like the OBP sandbox: same tools, same
+limits, same confirmation slips and security codes. It's deleted 24 hours after it was opened, with
+the visitor's conversations and requests. "Start over" gives them a fresh one.
+
+Your two demo customers (Robert, Anil) still use the real OBP sandbox, side by side.
+
+**Send, then check back.** An answer takes 5-30 seconds, longer than gateways like to hold a request
+open. So the page sends the message, gets a ticket back at once (`turn_id`), and checks every second,
+showing each step as it happens ("Accounts specialist", "Using list my accounts"). Answers, waiting
+slips and sign-ins are all in the database, so a restart, a deploy or a second copy of the app
+signs nobody out, and a reload brings back the conversation, the slip and even the code box.
+
+**Limits for visitors** (you, the owner, have none), set in `.env`:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `GUEST_DAILY_MESSAGES` | 30 | messages per visitor per 24 hours |
+| `GUEST_SIGNUPS_PER_IP_HOUR` | 5 | new demo banks per internet address per hour |
+| `DAILY_SPEND_CAP_USD` | 2.00 | what all visitors together may spend on the model per day; then "come back tomorrow" |
+| `GUEST_TTL_HOURS` | 24 | how long a demo bank lives |
+
+Also set a monthly spend limit in the Anthropic Console (Settings > Limits) as a last line of defence.
+
+**APP_SECRET.** A visitor's bank token is signed, so nobody can make one up. Put a long random value in
+`.env` (the web chat and the bank servers must share it):
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(32))"     # paste the result as APP_SECRET=...
+```
+
+Without it the app uses a development secret and logs a warning.
+
+**Security codes for visitors** go to the address they signed in with, once the sign-in has proved
+the address is theirs (section 12). With the simple form (`AUTH_MODE=dev`) anyone could type anyone's
+address, so there visitors' codes go to `OTP_EMAIL_TO`, like the demo customers' do.
+
+**Try it:** start the app as before (or `docker compose up --build`), open http://127.0.0.1:8000, and
+sign in with any email under "Try the banking assistant".
+
+Offline tests (no keys): `python tests/test_guest_bank.py` and `python tests/test_api_offline.py`;
+both also run on Postgres with `TEST_DATABASE_URL` set.
+
+## 12. Phase 4, step 4b: real sign-in
+
+`AUTH_MODE=public` replaces the simple form with real sign-in, built into the app (`api/signin.py`):
+
+- **Continue with Google.** Google tells the app the person's verified email address. The app
+  checks the reply came from Google, for this app, for this sign-in (state, nonce and PKCE).
+- **Or email me a code.** A 6-digit code, valid 10 minutes, three tries, sent the same way as
+  security codes. Limits keep the app from flooding anyone's inbox: 3 codes per address per
+  15 minutes, 10 per internet address per hour, 300 a day in total (Gmail sends at most 500 a day).
+
+Either way the address is proven, so visitors' security codes go to it. Signing in with an address
+in `OWNER_EMAILS` makes you the owner: you pick Robert or Anil (and can switch with "Switch customer").
+
+**Set up Google sign-in** (free, about 10 minutes):
+
+1. Open https://console.cloud.google.com, and create a project (project picker at the top >
+   New project), named for example "Demo Bank assistant".
+2. Open **Google Auth Platform** (https://console.cloud.google.com/auth/overview) > **Get started**.
+   App name: "Demo Bank assistant"; support email: yours; Audience: **External**; contact email:
+   yours. Agree and **Create**.
+3. **Clients** > **Create client**. Application type **Web application**, name "Demo Bank web".
+   Under **Authorized redirect URIs** add `http://127.0.0.1:8000/api/auth/google/callback`. **Create**,
+   then copy the **Client ID** and **Client secret** (the secret is only shown once).
+4. **Audience** > **Publish app**. Otherwise only test users you list can sign in. The app only asks
+   for name and email address, which needs no review by Google.
+5. In `.env` (never in chat or GitHub):
+
+```
+AUTH_MODE=public
+PUBLIC_URL=http://127.0.0.1:8000
+GOOGLE_CLIENT_ID=...apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=...
+OWNER_EMAILS=you@gmail.com
+EMAIL_BACKEND=smtp            # so sign-in codes really arrive (console: they're printed by the web chat)
+```
+
+Then `docker compose up --build` (or `python -m api`) and open http://127.0.0.1:8000. On AWS the
+app gets an https address in step 5; that address's `/api/auth/google/callback` is then added to the
+same Google client, and `PUBLIC_URL` set to it.
+
+Without `GOOGLE_CLIENT_ID` the page offers email codes only. `AUTH_MODE=dev` brings the simple form back.
+
+## 13. Phase 4, step 5: the app on AWS, open 09:00-17:00
+
+```
+browser --https--> CloudFront --> API Gateway --VPC link--> Fargate task [ web chat | bank servers ] --> Postgres
+                   opening hours,  pay per request           0.25 vCPU / 1 GB, 1-3 copies           isolated subnet
+                   secret header
+```
+
+- **CloudFront** gives the app an https address (`https://d....cloudfront.net`), which Google sign-in
+  needs. A small CloudFront Function shows a "We're closed" page outside opening hours and passes on
+  the visitor's address (for the sign-up limits).
+- **API Gateway** instead of a load balancer: about $1 per million requests instead of about $18 a
+  month. The page's "is my answer ready?" checks are now *long* checks (the server holds each one up to
+  20 seconds until there's news), so a whole conversation takes a handful of requests.
+- **Only through CloudFront.** CloudFront adds a secret header; the app refuses requests without it.
+  `python -m infra.app_secrets push` makes that secret for you (`ORIGIN_SECRET`).
+- **Opening hours** (`OPEN_HOURS`, Irish time): the database starts at 08:30 and stops at 17:10, the
+  app starts at 08:45 and stops at 17:00. While open: 1 copy, up to 3 when busy (`APP_MAX_COPIES`).
+- **Invite-only** until step 6 adds the firewall: only `OWNER_EMAILS` and `INVITED_EMAILS` can sign in
+  (`OPEN_TO_PUBLIC=0`). Others aren't even sent a sign-in code.
+- The visitors' bank now uses the same single-transfer limit as yours (`OBP_MAX_TRANSFER`, £800).
+
+**Cost** (eu-west-1, open 8¼ hours a day, every day; checked October 2026):
+
+| Part | About |
+|---|---|
+| Fargate task, 0.25 vCPU + 1 GB, while open | $3.70 |
+| Its public IPv4 address, while open | $1.25 |
+| Postgres db.t4g.micro, while running | $4.30 |
+| Postgres storage, 20 GB (charged even when stopped) | $2.50 |
+| Secrets Manager (app secret + database password) | $0.80 |
+| Cloud Map (private DNS zone + 1 entry) | $0.60 |
+| API Gateway, CloudFront, CloudFront Function, schedules | $0 at demo traffic (free allowances) |
+| CloudWatch logs, image storage | under $0.50 |
+| **Total** | **about $14 a month**, plus about $0.015 an hour for each extra copy when busy |
+
+The model (Anthropic or Bedrock) is billed separately; visitors' share is capped by `DAILY_SPEND_CAP_USD`.
+
+**Deploy** (Docker Desktop running; from the project folder, `.venv` active):
+
+1. In `.env`: `OWNER_EMAILS`, `GOOGLE_CLIENT_ID` (+ secret), `EMAIL_BACKEND=smtp` and the `SMTP_*` lines,
+   `APP_SECRET`, your `MODEL` and its key. Optional: `INVITED_EMAILS=friend@gmail.com,...`,
+   `OPEN_HOURS=09:00-17:00` (or `always`).
+2. Copy the secrets to AWS: `python -m infra.app_secrets push` (it warns if one the app needs is empty).
+3. `cd infra`, then `cdk deploy BankApp`. The first time takes 15-25 minutes (CloudFront and the
+   database are the slow parts). Deploy during opening hours: deployed in the evening, the app and
+   database run until the next closing time (about $0.50).
+4. It prints `AppUrl` and `GoogleRedirectUri`. Add `GoogleRedirectUri` to your Google client
+   (Google Auth Platform > Clients > your client > Authorized redirect URIs > Add URI > Save).
+5. Open `AppUrl` and sign in with your owner address.
+6. To let anyone use "Continue with Google", Google wants a home page and a privacy notice. In Google
+   Auth Platform > **Branding**: App home page = `AppUrl`; Privacy policy = `PrivacyUrl` (the app's
+   `/privacy.html`, served even when closed; its contact address is `CONTACT_EMAIL`, else your first
+   `OWNER_EMAILS`); Authorized domains = the `d....cloudfront.net` part of `AppUrl`; no logo (a logo
+   means a review by Google). Save, then **Audience** > **Publish app**.
+7. For everyone, not just invited addresses: `OPEN_TO_PUBLIC=1` in `.env`, then `cdk deploy BankApp`.
+
+Logs: `aws logs tail /banking-agent/app --follow` (app) and the `BankApp-ApiLogs...` group (API Gateway).
+Change the hours: edit `OPEN_HOURS`, then `cdk deploy BankApp` again. Remove it all: `cdk destroy BankApp`
+(the secret stays, $0.40 a month: `python -m infra.app_secrets delete` removes it too).
 
 ## Layout
 
@@ -351,8 +503,13 @@ evals/run.py                   the eval CLI, gates, LangSmith experiments
 tests/test_guardrails.py       guardrails, costs, trace redaction
 tests/test_evals_offline.py    the eval machinery, with a scripted model
 .github/workflows/ci.yml       offline tests + eval gates in CI
-api/app.py                     web API: sessions, chat, confirmations with codes, history
+api/app.py                     web API: sign-in, send-then-check answers, confirmations with codes, limits
+api/state.py                   sessions, answers in progress and waiting slips, in the database
+api/signin.py                  real sign-in: Google (OpenID Connect) and emailed sign-in codes
+mailer/__init__.py             sending email (console or SMTP), for security and sign-in codes
 api/actions.py                 what each action looks like on the confirmation slip
+obp/guest_bank.py              visitors' pretend banks (OBP-compatible, in the database)
+tests/test_guest_bank.py       visitors' banks on SQLite and Postgres
 web/                           the chat page (index.html, app.css, app.js)
 tests/test_api_offline.py      the web API end to end, with a scripted model
 storage/__init__.py            where records go: Postgres (DATABASE_URL) or SQLite files
@@ -363,7 +520,8 @@ docker-compose.yml             Postgres + bank servers + web chat on your PC
 infra/app.py                   the AWS setup (CDK): BankBudget and BankApp
 infra/settings.py              which .env settings go to AWS (and that secrets never do)
 infra/stacks/budget.py         the budget alarm
-infra/stacks/bank.py           network, database, Fargate task, load balancer, logs
+infra/stacks/bank.py           network, database, Fargate task, API Gateway, CloudFront, opening hours
+infra/stacks/opening_hours.py  the CloudFront Function: closed page outside opening hours
 infra/app_secrets.py           copy passwords and keys from .env to Secrets Manager
 infra/tests/test_stacks.py     checks on the AWS setup, no AWS account needed
 ```

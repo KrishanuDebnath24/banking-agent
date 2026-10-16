@@ -26,7 +26,8 @@ RUN python -m compileall -q /app \
 # Containers listen on all interfaces; the SQLite paths are only used if DATABASE_URL isn't set.
 ENV API_HOST=0.0.0.0 PORT=8000 PYTHONDONTWRITEBYTECODE=1 \
     SESSION_DB=/app/data/sessions.db OTP_DB=/app/data/verification.db \
-    TELEMETRY_DB=/app/data/telemetry.db SERVICE_REQUESTS_DB=/app/data/service_requests.db
+    TELEMETRY_DB=/app/data/telemetry.db SERVICE_REQUESTS_DB=/app/data/service_requests.db \
+    GUEST_DB=/app/data/guest_banks.db WEB_DB=/app/data/web.db
 
 USER bank
 EXPOSE 8000

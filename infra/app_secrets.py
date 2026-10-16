@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import sys
 
 from infra.settings import PROJECT, SECRET_KEYS, SECRET_NAME, read_env
@@ -20,7 +21,7 @@ from infra.settings import PROJECT, SECRET_KEYS, SECRET_NAME, read_env
 
 def needed(env: dict[str, str]) -> set[str]:
     """Keys the app can't work without, given the rest of .env."""
-    keys = {"OBP_CONSUMER_KEY", "OBP_CONSUMER_SECRET"}
+    keys = {"OBP_CONSUMER_KEY", "OBP_CONSUMER_SECRET", "APP_SECRET"}
     if env.get("OBP_FAKE") != "1":
         keys |= {"CUSTOMER_A_PASSWORD", "CUSTOMER_B_PASSWORD"}
     if env.get("MODEL", "").startswith("anthropic:"):
@@ -29,6 +30,8 @@ def needed(env: dict[str, str]) -> set[str]:
         keys.add("SMTP_PASSWORD")
     if env.get("LANGSMITH_TRACING", "").lower() == "true":
         keys.add("LANGSMITH_API_KEY")
+    if env.get("GOOGLE_CLIENT_ID", "").strip():
+        keys.add("GOOGLE_CLIENT_SECRET")
     return keys
 
 
@@ -43,13 +46,28 @@ def report(values: dict[str, str], env: dict[str, str]) -> int:
         print(f"  {key:<22} {'set' if values.get(key) else 'empty'}")
     if missing:
         print(f"\nWarning: the app needs these but they're empty in .env: {', '.join(missing)}")
+        if "APP_SECRET" in missing:
+            print('Make an APP_SECRET with:  python -c "import secrets; print(secrets.token_urlsafe(32))"'
+                  "  and paste it into .env.")
         return 1
     return 0
+
+
+def _stored(sm) -> dict[str, str]:
+    """What the secret holds now ({} if it doesn't exist or is deleted)."""
+    try:
+        return json.loads(sm.get_secret_value(SecretId=SECRET_NAME)["SecretString"])
+    except (sm.exceptions.ResourceNotFoundException, sm.exceptions.InvalidRequestException):
+        return {}
 
 
 def push(region: str, env: dict[str, str]) -> int:
     sm = client(region)
     values = {key: env.get(key, "") for key in SECRET_KEYS}  # every key present: containers expect all of them
+    if not values.get("ORIGIN_SECRET"):
+        # CloudFront's secret header: nobody needs to type it, so it's made here once and then kept
+        # (CloudFront picks it up when you deploy).
+        values["ORIGIN_SECRET"] = _stored(sm).get("ORIGIN_SECRET") or secrets.token_urlsafe(32)
     body = json.dumps(values)
     try:
         info = sm.describe_secret(SecretId=SECRET_NAME)

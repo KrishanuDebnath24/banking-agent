@@ -10,7 +10,7 @@ from collections import defaultdict
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from mcp_servers.common import (CLIENT, PORTS, OBPError, bank, customer, error, parse_date, rows_for,
+from mcp_servers.common import (PORTS, OBPError, bank, customer, error, parse_date, rows_for,
                                  transport_security)
 
 mcp = FastMCP("transactions", port=PORTS["transactions"], stateless_http=True, json_response=True,
@@ -31,7 +31,7 @@ async def _rows(ctx, account, search, from_date, to_date):
     f, t = parse_date(from_date, "from_date"), parse_date(to_date, "to_date")
     out = {}
     for acc_id in ids:
-        raw = await bank(CLIENT.transactions, cust.token, cust.bank_id, acc_id)
+        raw = await bank(cust.obp.transactions, cust.token, cust.bank_id, acc_id)
         out[cust.name_of(acc_id)] = rows_for(cust, raw, f, t, search)
     return cust, out
 

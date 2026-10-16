@@ -18,6 +18,12 @@ HTTP API on port 8104, called by the chat app with the customer's OBP token:
     POST /verify/check  {"challenge_id": ..., "code": "123456"}
         -> {"verified": true}  |  {"verified": false, "error": ..., "attempts_left": 2}
 
+Where codes go:
+    visitors who signed in with Google or an emailed code   their own address
+    the owner's demo customers (A, B), and visitors whose    OTP_EMAIL_TO (the demo customers'
+    address wasn't checked (the dev sign-in)                 @example.com addresses get no mail,
+                                                             and an unchecked address could be anyone's)
+
 Settings (.env): OTP_TRANSFER_THRESHOLD, OTP_EMAIL_TO, EMAIL_BACKEND (console|smtp),
 SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM.
 Codes are kept (hashed) in the challenges table: Postgres if DATABASE_URL is set, else OTP_DB.
@@ -31,19 +37,17 @@ import hmac
 import json
 import os
 import secrets
-import smtplib
-import ssl
 import threading
 import time
 from contextlib import contextmanager
-from email.message import EmailMessage
 
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from mcp_servers.common import CLIENT, Customer, customer_for_token, token_from_header
+from mailer import mask, send_email  # noqa: F401 - send_email is replaced in tests
+from mcp_servers.common import Customer, customer_for_token, token_from_header
 from storage import OTP
 
 CODE_TTL = 300          # seconds a code is valid, and how long a confirmed code may be used
@@ -81,13 +85,14 @@ def _amount(args: dict) -> float | None:
         return None
 
 
-def needs_code(tool: str, args: dict) -> bool:
+def needs_code(tool: str, args: dict, max_transfer: float) -> bool:
+    """max_transfer: the customer's bank's limit (cust.obp.max_transfer)."""
     if tool == ADDRESS:
         return True
     if tool == TRANSFER:
         amount, threshold = _amount(args), transfer_threshold()
         # Above the transfer limit the bank refuses anyway, so don't make the customer type a code first.
-        return amount is not None and threshold is not None and threshold <= amount <= CLIENT.max_transfer
+        return amount is not None and threshold is not None and threshold <= amount <= max_transfer
     return False
 
 
@@ -129,54 +134,21 @@ def _hash(salt: str, code: str) -> str:
 # ---------- email ----------
 
 def recipient(cust: Customer) -> str:
-    """Demo customers have @example.com addresses that can't receive mail, so codes go to OTP_EMAIL_TO."""
+    """A visitor's own address when their sign-in proved it's theirs. Otherwise OTP_EMAIL_TO: the demo
+    customers' @example.com addresses can't receive mail, and an unchecked address could be anyone's."""
+    if cust.email:
+        return cust.email
     to = (os.environ.get(f"OTP_EMAIL_TO_{cust.label}") or os.environ.get("OTP_EMAIL_TO") or "").strip()
     if not to and os.environ.get("EMAIL_BACKEND", "console").strip().lower() == "smtp":
         raise VerificationError("email_failed", "OTP_EMAIL_TO is not set in .env, so there's nowhere to send the code.", 502)
     return to or cust.username
 
 
-def mask(email: str) -> str:
-    name, _, domain = email.partition("@")
-    return f"{name[:1]}***@{domain}" if domain else "***"
-
-
-def send_email(to: str, subject: str, body: str) -> None:
-    backend = os.environ.get("EMAIL_BACKEND", "console").strip().lower()
-    if backend == "smtp":
-        user = os.environ.get("SMTP_USER", "").strip()
-        password = os.environ.get("SMTP_PASSWORD", "").replace(" ", "")  # Gmail shows app passwords in groups of 4
-        host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-        port = int(os.environ.get("SMTP_PORT", "587"))
-        msg = EmailMessage()
-        msg["From"] = os.environ.get("EMAIL_FROM") or user
-        msg["To"] = to
-        msg["Subject"] = subject
-        msg.set_content(body)
-        context = ssl.create_default_context()
-        if port == 465:
-            with smtplib.SMTP_SSL(host, port, context=context, timeout=20) as s:
-                s.login(user, password)
-                s.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=20) as s:
-                s.starttls(context=context)
-                s.login(user, password)
-                s.send_message(msg)
-        return
-    # console: show the email in the MCP server terminal (no setup needed)
-    print(f"\n----- email to {to} -----\nSubject: {subject}\n\n{body}\n--------------------------", flush=True)
-    outbox = os.environ.get("OTP_OUTBOX")  # tests read codes from here
-    if outbox:
-        with open(outbox, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"to": to, "subject": subject, "body": body}) + "\n")
-
-
 # ---------- the three operations ----------
 
 def start(cust: Customer, tool: str, args: dict) -> dict:
     """Email a code if this action needs one."""
-    if not needs_code(tool, args):
+    if not needs_code(tool, args, cust.obp.max_transfer):
         return {"required": False}
     to = recipient(cust)
     now, fp = time.time(), fingerprint(tool, args)
@@ -293,7 +265,8 @@ def summary() -> str:
     threshold = transfer_threshold()
     when = "address changes" + (f" and transfers from £{threshold:.2f}" if threshold is not None else "")
     if os.environ.get("EMAIL_BACKEND", "console").strip().lower() == "smtp":
-        where = f"emailed to {mask(os.environ.get('OTP_EMAIL_TO', '').strip() or '(OTP_EMAIL_TO not set)')}"
+        where = (f"emailed to signed-in visitors, else to "
+                 f"{mask(os.environ.get('OTP_EMAIL_TO', '').strip() or '(OTP_EMAIL_TO not set)')}")
     else:
         where = "printed in this window (EMAIL_BACKEND=console)"
     return f"Security codes for {when}: {where}"
