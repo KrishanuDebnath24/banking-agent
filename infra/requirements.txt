@@ -1,0 +1,7 @@
+# The AWS setup (phase 4). Install into the same .venv:  pip install -r infra/requirements.txt
+# The cdk command itself comes from Node.js:            npm install -g aws-cdk
+aws-cdk-lib>=2.273,<3
+constructs>=10,<11
+python-dotenv>=1.0
+boto3>=1.35
+cdk-nag>=3.0,<4           # AWS security checks, used by infra/tests

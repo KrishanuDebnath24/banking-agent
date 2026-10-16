@@ -270,6 +270,43 @@ python tests/test_api_offline.py                # the web API end to end on Post
 Remove-Item Env:TEST_DATABASE_URL
 ```
 
+## 10. Phase 4, step 3: the AWS setup as code
+
+`infra/` describes everything the app needs on AWS, in Python (AWS CDK). One command creates it,
+one deletes it, so it only exists (and costs) while you're demoing.
+
+| Stack | What it is | Cost |
+|---|---|---|
+| `BankBudget` | an email at 50%, 80% and 100% of $25 a month, and when the month is heading past it. Counts spending *before* credits, so it warns while credits are paying | free; keep it |
+| `BankApp` | network without a NAT gateway; the smallest Postgres (in subnets with no internet route); one Fargate task running the web chat and the bank servers side by side; a load balancer only your address can reach (`ALLOWED_CIDR`); logs kept a week | about $0.09 an hour while it exists, so a 3-hour demo costs about $0.30, a forgotten day about $2 |
+
+Passwords and API keys never go into the templates: `python -m infra.app_secrets push` copies them
+from `.env` to AWS Secrets Manager, and the containers read them from there when they start.
+
+**One-time setup** (from the project folder, `.venv` active):
+
+```powershell
+pip install -r infra/requirements.txt
+npm install -g aws-cdk
+aws sts get-caller-identity                              # which AWS login you're using
+aws freetier get-account-plan-state --region us-east-1   # FREE or PAID plan
+```
+
+**Step 3: the budget alarm only.** Put `BUDGET_EMAIL=you@example.com` in `.env`, then:
+
+```powershell
+cd infra
+cdk bootstrap            # once per account and region: CDK's own small bucket and image store
+cdk deploy BankBudget    # creates the budget alarm
+cdk diff BankApp         # lists what step 4 will create; creates nothing
+cd ..
+```
+
+**Checks without AWS** (also run on GitHub): `python infra/tests/test_stacks.py`. These build the
+templates and check, for example: no NAT gateway, database not public, only your address reaches the
+load balancer, no password in any template, and the AWS security checks (cdk-nag), where every
+finding is either fixed or accepted with a written reason in `infra/stacks/bank.py`.
+
 ## Layout
 
 ```
@@ -323,4 +360,10 @@ tests/test_storage.py          every kind of record, on SQLite and Postgres
 tests/pg_scratch.py            a throwaway Postgres schema per test run
 Dockerfile                     one image: web chat (default) or bank servers
 docker-compose.yml             Postgres + bank servers + web chat on your PC
+infra/app.py                   the AWS setup (CDK): BankBudget and BankApp
+infra/settings.py              which .env settings go to AWS (and that secrets never do)
+infra/stacks/budget.py         the budget alarm
+infra/stacks/bank.py           network, database, Fargate task, load balancer, logs
+infra/app_secrets.py           copy passwords and keys from .env to Secrets Manager
+infra/tests/test_stacks.py     checks on the AWS setup, no AWS account needed
 ```

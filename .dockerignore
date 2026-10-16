@@ -18,6 +18,8 @@ tests/
 .vscode/
 .idea/
 cdk.out/
+**/cdk.out/
+infra/
 Dockerfile
 docker-compose.yml
 .dockerignore

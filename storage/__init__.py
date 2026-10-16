@@ -1,6 +1,7 @@
 """Where the app keeps its records: SQLite files on your PC, one Postgres database in Docker and on AWS.
 
     DATABASE_URL=postgresql://bank:PASSWORD@host:5432/bank     use Postgres for everything
+    DATABASE_URL=postgresql://  plus PGHOST, PGUSER, PGPASSWORD...   the same, settings split up (AWS)
     DATABASE_URL not set                                       SQLite files in the project folder
 
 What is kept:
@@ -53,7 +54,12 @@ def describe() -> str:
     if not url:
         return "SQLite files"
     p = urlsplit(url)
-    return f"Postgres {p.username or ''}@{p.hostname}:{p.port or 5432}{p.path}"
+    # On AWS the URL is just "postgresql://" and the driver reads PGHOST, PGUSER... instead.
+    user = p.username or os.environ.get("PGUSER", "")
+    host = p.hostname or os.environ.get("PGHOST", "localhost")
+    port = p.port or os.environ.get("PGPORT", "5432")
+    name = p.path.lstrip("/") or os.environ.get("PGDATABASE", "")
+    return f"Postgres {user}@{host}:{port}/{name}"
 
 
 def pool_size() -> int:
