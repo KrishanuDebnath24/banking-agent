@@ -319,7 +319,20 @@ if __name__ == "__main__":
     servers = subprocess.Popen([sys.executable, "-m", "mcp_servers.run"], cwd=ROOT, env=ENV,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        time.sleep(4)
+        # Wait until all five servers answer (a fixed pause was sometimes too short on a slow CI machine).
+        import socket
+
+        def answering(port: int) -> bool:
+            with socket.socket() as sock:
+                return sock.connect_ex(("127.0.0.1", port)) == 0
+
+        ports, deadline = [8301, 8302, 8303, 8304, 8305], time.time() + 90
+        while time.time() < deadline and servers.poll() is None:
+            if all(answering(p) for p in ports):
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("the bank servers didn't start (ports 8301-8305)")
         code = asyncio.run(main())
     finally:
         servers.terminate()
