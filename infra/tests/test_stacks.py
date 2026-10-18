@@ -163,6 +163,9 @@ def main() -> int:
           "Privacy notice" in gate["FunctionCode"] and "mailto:owner@example.test" in gate["FunctionCode"]
           and len(gate["FunctionCode"].encode()) <= 10240 and "PrivacyUrl" in t.to_json()["Outputs"])
 
+    check("no firewall (AWS WAF): CloudFront has none, and no other stack is needed",
+          "WebACLId" not in site and "WAFv2" not in json.dumps(t.to_json()))
+
     # ---- opening hours ----
     scaling = only(res, "AWS::ApplicationAutoScaling::ScalableTarget")
     actions = {a["ScheduledActionName"]: a for a in scaling["ScheduledActions"]}

@@ -10,7 +10,8 @@ What is kept:
     service requests   service_requests                    REQUESTS         SQLite file: SERVICE_REQUESTS_DB
     cost ledger        turns, llm_calls, guard_checks      LEDGER           SQLite file: TELEMETRY_DB
     visitors' banks    guest_customers, guest_accounts...  GUESTS           SQLite file: GUEST_DB
-    web chat state     web_sessions, chat_turns, chat_pending, signin_codes   WEB   SQLite file: WEB_DB
+    web chat state     web_sessions, chat_turns, chat_pending, signin_codes, chat_threads   WEB   SQLite file: WEB_DB
+    chart data         chart_datasets (figures saved for charts)   CHARTS       SQLite file: CHART_DB
 
 The SQL in this project is written once for both databases: ? placeholders, plain types
 (TEXT, INTEGER, DOUBLE PRECISION) and ON CONFLICT for upserts. Tables are created on first use,
@@ -257,7 +258,18 @@ WEB = Store("web chat state", "WEB_DB", "web.db", """
         created DOUBLE PRECISION NOT NULL, expires DOUBLE PRECISION NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
         used DOUBLE PRECISION);
     CREATE INDEX IF NOT EXISTS signin_codes_email ON signin_codes (email, created);
-    CREATE INDEX IF NOT EXISTS signin_codes_ip ON signin_codes (ip_hash, created)
+    CREATE INDEX IF NOT EXISTS signin_codes_ip ON signin_codes (ip_hash, created);
+    CREATE TABLE IF NOT EXISTS chat_threads (
+        thread_id TEXT PRIMARY KEY, owner_key TEXT NOT NULL, title TEXT NOT NULL,
+        created DOUBLE PRECISION NOT NULL, updated DOUBLE PRECISION NOT NULL);
+    CREATE INDEX IF NOT EXISTS chat_threads_owner ON chat_threads (owner_key, updated)
+""")
+
+CHARTS = Store("chart data", "CHART_DB", "chart_data.db", """
+    CREATE TABLE IF NOT EXISTS chart_datasets (
+        dataset_id TEXT PRIMARY KEY, owner TEXT NOT NULL, kind TEXT NOT NULL,
+        created DOUBLE PRECISION NOT NULL, payload TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS chart_datasets_owner ON chart_datasets (owner, created)
 """)
 
 

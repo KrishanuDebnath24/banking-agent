@@ -94,8 +94,7 @@ def is_owner(email: str) -> bool:
 
 
 def open_to_public() -> bool:
-    """OPEN_TO_PUBLIC=0: invite-only. Only OWNER_EMAILS and INVITED_EMAILS can sign in (the AWS
-    preview, until the firewall is in place)."""
+    """OPEN_TO_PUBLIC=0: invite-only. Only OWNER_EMAILS and INVITED_EMAILS can sign in."""
     return os.environ.get("OPEN_TO_PUBLIC", "1").strip() != "0"
 
 

@@ -190,12 +190,12 @@ class BankStack(Stack):
                     function=gate, event_type=cloudfront.FunctionEventType.VIEWER_REQUEST)]))
         _ack(site, {
             "AwsSolutions-CFR1": "Open to every country: it's a public demo.",
-            "AwsSolutions-CFR2": "The firewall (AWS WAF) comes in step 6, before the public opening. Until then "
-                                 "sign-in is invite-only.",
             "AwsSolutions-CFR3": "Access logs need a bucket; API Gateway and the app log every request.",
             "AwsSolutions-CFR4": "The default cloudfront.net certificate can't set a minimum TLS version; "
                                  "a custom domain would.",
         })
+        _ack(site, {"AwsSolutions-CFR2": "No AWS WAF (it would cost about $9 a month). The app limits sign-ups, "
+                                         "messages, codes and spending per visitor, and API Gateway caps requests."})
         public_url = f"https://{site.distribution_domain_name}"
 
         # ---------- the containers ----------

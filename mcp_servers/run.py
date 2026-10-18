@@ -1,7 +1,7 @@
 """Start the MCP servers.
 
-    python -m mcp_servers.run                 # all in one process: 3 MCP servers (8101-8103)
-                                              # + the security code service (8104)
+    python -m mcp_servers.run                 # all in one process: 3 bank MCP servers (8101-8103),
+                                              # the security code service (8104), charts (8105)
     python -m mcp_servers.run --only service  # just one, e.g. to run them in separate terminals
 
 Leave it running while you chat. Servers listen on 127.0.0.1 only (MCP_HOST changes that; Docker
@@ -25,6 +25,7 @@ MODULES = {
     "transactions": "mcp_servers.transactions.server",
     "service": "mcp_servers.services.server",
     "verify": "mcp_servers.verification",   # security codes: plain HTTP for the chat app, not MCP
+    "charts": "mcp_servers.charts.server",  # draws figures the transactions server saved; no bank access
 }
 
 

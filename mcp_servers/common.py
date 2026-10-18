@@ -50,7 +50,8 @@ def _make_client():
 CLIENT = _make_client()
 _OFFSET = int(os.environ.get("MCP_PORT_OFFSET", "0"))  # evals and tests run a second set of servers
 PORTS = {"accounts": 8101 + _OFFSET, "transactions": 8102 + _OFFSET, "service": 8103 + _OFFSET,
-         "verify": 8104 + _OFFSET}  # verify: security codes (plain HTTP, not MCP)
+         "verify": 8104 + _OFFSET,  # verify: security codes (plain HTTP, not MCP)
+         "charts": 8105 + _OFFSET}  # charts: draws saved figures; no bank access
 
 
 def transport_security():

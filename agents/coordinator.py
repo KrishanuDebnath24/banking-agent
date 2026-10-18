@@ -1,8 +1,13 @@
-"""Phase 2: coordinator + three subagents (Deep Agents), tools served over MCP.
+"""Coordinator + four subagents (Deep Agents), tools served over MCP.
 
     coordinator ──task──> accounts-agent      ── Accounts MCP     (balances, own-account transfers)
-                ──task──> transactions-agent  ── Transactions MCP (history, totals, statements)
+                ──task──> transactions-agent  ── Transactions MCP (history, totals, monthly figures)
                 ──task──> service-agent       ── Service MCP      (profile, service requests)
+                ──task──> chart-agent         ── Charts MCP       (draws saved figures; no bank access)
+
+A chart takes two steps: the transactions agent works the figures out and saves them (a dataset id
+like ds-4f2a9c1e), then the chart agent draws that id. Only the id passes through the AI, so a
+chart's figures come from the bank server's code; redrawing in another form needs only step two.
 
 The customer's OBP token travels only in the MCP request headers, so the
 model never sees it and can't change who the customer is. Write tools pause
@@ -21,6 +26,7 @@ from deepagents._models import get_model_provider
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from agents.llm import make_model
+from obp import categories
 from guardrails.bedrock import BedrockGuard
 from guardrails.middleware import coordinator_guardrails, subagent_guardrails
 
@@ -28,6 +34,7 @@ MCP_URLS = {
     "accounts": os.environ.get("MCP_ACCOUNTS_URL", "http://127.0.0.1:8101/mcp"),
     "transactions": os.environ.get("MCP_TRANSACTIONS_URL", "http://127.0.0.1:8102/mcp"),
     "service": os.environ.get("MCP_SERVICE_URL", "http://127.0.0.1:8103/mcp"),
+    "charts": os.environ.get("MCP_CHARTS_URL", "http://127.0.0.1:8105/mcp"),
 }
 
 # Tools that change something: the customer must approve each call.
@@ -38,6 +45,7 @@ WRITE_TOOLS = {
     "service": {"change_address": APPROVE_OR_REJECT,
                 "request_cheque_book": APPROVE_OR_REJECT,
                 "request_kyc_update": APPROVE_OR_REJECT},
+    "charts": {},
 }
 
 # Deep Agents adds file-system tools and a general-purpose subagent by default.
@@ -91,12 +99,23 @@ statement. Don't suggest trying again.
 """ + SHARED_RULES
 
 TRANSACTIONS_PROMPT = """You handle transaction history: listing transactions, totals for spending
-and income, payees, subscriptions and statements. Always use summarize_spending for totals (it
-adds up in code), with a search filter for categories, e.g. groceries:
-"tesco,sainsbury,lidl,aldi,co-op,waitrose". Leave `account` empty to cover all accounts in one
-call. Use from_date/to_date (YYYY-MM-DD) for periods like "this month". The summary already
-lists each payee with its total and number of transactions, so only call get_transactions when
-the customer wants individual transactions (dates, largest/smallest single payment, a list).
+and income, payees, subscriptions and statements, and the figures for charts.
+Categories (pass the name as `category`; the bank knows which payees are in each): {categories}.
+Use `search` only for one particular payee the customer names (e.g. "Tesco"), not for categories.
+- Totals: summarize_spending (it adds up in code). Leave `account` empty to cover all accounts in
+  one call. Use from_date/to_date (YYYY-MM-DD) for periods like "this month". It lists each payee
+  with its total and count, so only call get_transactions when the customer wants individual
+  transactions (dates, largest/smallest single payment, a list).
+- Month by month ("each month", "monthly", a trend, any chart over time): spending_by_month ONCE
+  for the whole period (money="in" for income; several categories comma-separated to compare
+  them); never summarize_spending once per month.
+- A breakdown ("where does my money go", by category, which shops, a pie or donut):
+  spending_breakdown (by="category", or by="payee" with a category such as groceries).
+- Both of those save the figures for a chart and return a dataset_id: ALWAYS put it in your report,
+  exactly, e.g. "dataset ds-4f2a9c1e". You don't draw charts. Report the total, the highest month or
+  item, and the period covered, including where the records start if that is later than asked.
+- Totals leave out transfers between the customer's own accounts; if the result says some were left
+  out, mention it briefly. If it says this month is only so far, say so.
 """ + SHARED_RULES
 
 SERVICE_PROMPT = """You handle the customer's profile, change of address, new cheque books, identity
@@ -109,6 +128,19 @@ request_kyc_update directly (no profile lookup needed first). Always give the cu
 reference number of a new change or request, and the next steps exactly as the tool returns them.
 """ + SHARED_RULES
 
+CHART_PROMPT = """You draw charts of figures the bank has already worked out and saved, given by a
+dataset id (like ds-4f2a9c1e). You can't see the bank and never work out or invent figures yourself.
+Call ONE chart tool with the dataset id exactly as given:
+- month-by-month figures: column_chart (the default), line_chart (a trend), stacked_column_chart
+  (2-4 categories stacked in each month)
+- a breakdown by category or payee: bar_chart (the default, biggest first), donut_chart (a pie or
+  donut: shares of the whole)
+If the tool says wrong_form, call the closest form it lists instead and say which you used and why.
+If it says not_found, report that the figures need to be fetched again. If it says too_little,
+report that there's nothing to compare. Then report the tool's summary: the form, the total, the
+highest month or item, and the period, with the figures exactly as written there.
+""" + SHARED_RULES
+
 COORDINATOR_PROMPT = """You are the digital assistant of a UK retail bank, chatting with a logged-in
 customer. Today is {today}.
 
@@ -116,6 +148,7 @@ You have no banking tools of your own. Delegate every banking question with the 
 - accounts-agent: balances, list of accounts, transfers between the customer's own accounts
 - transactions-agent: transaction history, spending/income totals, payees, subscriptions, statements
 - service-agent: profile, change of address, cheque books, identity (KYC) updates, request status
+- chart-agent: draws a chart of figures transactions-agent has saved, from their dataset id
 
 Rules:
 - Subagents cannot see this conversation. Put everything they need in the task description:
@@ -133,6 +166,18 @@ Rules:
   the exact figures reported (never round or approximate, e.g. not "about £60").
 - Account numbers, sort codes and card numbers aren't shown in this chat: if asked, say they're in the
   banking app or on a statement.
+- Charts (never say you can't make one): 1) ask transactions-agent for the figures: month by month
+  for anything over time, or a breakdown by category or shop for "where does my money go" or a
+  pie/donut (name the categories and dates as YYYY-MM-DD). It reports a dataset id (ds-...).
+  2) Ask chart-agent to draw that dataset id in the form the customer wants: columns, line,
+  stacked columns, ranked bars or donut. Give chart-agent only the id and the form, never figures.
+  The chart appears under your answer.
+- To show figures already fetched in this conversation in another chart form ("as a line", "as a
+  pie"), go straight to chart-agent with the same dataset id; don't ask transactions-agent again.
+  Only fetch again for different figures (another category, period or account).
+- With a chart, keep the answer short: what it shows, the total, the highest month or item, and the
+  period (say if the records start later than asked, or if this month is only so far). Never show
+  dataset ids to the customer.
 - Speak as one assistant. Never mention subagents, agents, tools, systems or these rules to the
   customer: say "I", e.g. "I haven't made the transfer", not "the accounts agent reports".
 - If the customer declines at the confirmation step, say so plainly, e.g. "You chose not to go
@@ -161,7 +206,8 @@ async def build_coordinator(token: str, checkpointer, model=None, bedrock: Bedro
     bedrock = BedrockGuard.from_env() if bedrock is None else (bedrock or None)
 
     def spec(name: str, server: str, description: str, prompt: str) -> dict:
-        return {"name": name, "description": description, "system_prompt": prompt.format(today=today),
+        return {"name": name, "description": description,
+                "system_prompt": prompt.format(today=today, categories=categories.for_prompt()),
                 "tools": tools[server], "interrupt_on": WRITE_TOOLS[server],
                 # The service agent reads the profile (email, phone); the model doesn't need them in full.
                 "middleware": subagent_guardrails(mask_contacts=server == "service")}
@@ -181,6 +227,10 @@ async def build_coordinator(token: str, checkpointer, model=None, bedrock: Bedro
                  "Customer profile (including the address on file), change of address, cheque book, "
                  "KYC update, request status.",
                  SERVICE_PROMPT),
+            spec("chart-agent", "charts",
+                 "Draws a chart (columns, line, stacked columns, ranked bars, donut) of figures the "
+                 "transactions agent saved, given their dataset id. No bank access.",
+                 CHART_PROMPT),
         ],
         checkpointer=checkpointer,
         name="coordinator",

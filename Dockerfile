@@ -1,6 +1,6 @@
 # One image for the whole app. It runs as two containers:
 #   web chat (default)   python -m api                ports 8000
-#   bank servers         python -m mcp_servers.run    ports 8101-8104
+#   bank servers         python -m mcp_servers.run    ports 8101-8105
 # On your PC:  docker compose up --build   (docker-compose.yml). On AWS: ECS Fargate (phase 4, step 4).
 #
 # No secrets inside: .env stays out (.dockerignore); settings and keys arrive as environment

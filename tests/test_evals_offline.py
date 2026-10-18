@@ -60,7 +60,7 @@ def say(text):
 
 async def score(case_id, script):
     case = by_id()[case_id]
-    runner = harness.Runner(model=Fake(messages=iter(script)))
+    runner = harness.Runner(model=Fake(messages=(item() if callable(item) else item for item in script)))
     inputs, ref = case_inputs(case), case.reference()
     outputs = await runner.run(inputs)
     scores = {}
@@ -83,6 +83,29 @@ async def main() -> int:
           any(sep_groceries.replace(",", "") in r for r in good["outputs"]["tool_results"]))
     check("well-behaved grocery answer passes every check", passed(good["scores"]) and good["outputs"]["error"] is None)
     check("cost measured for the case", good["outputs"]["model_calls"] == 4 and good["outputs"]["cost_usd"] > 0)
+
+    aug_groceries = fixture.money(fixture.spent("A", fixture.GROCERIES, "2026-08-01", "2026-08-31"))
+    import storage
+
+    def latest_dataset() -> str:
+        with storage.CHARTS.connect() as db:
+            return db.execute("SELECT dataset_id FROM chart_datasets ORDER BY created DESC LIMIT 1").fetchone()[0]
+
+    chart = await score("chart-groceries-monthly", [
+        call("task", subagent_type="transactions-agent",
+             description="Grocery spending for each month, 2026-08-01 to 2026-09-30, for a chart"),
+        call("spending_by_month", category="groceries", from_date="2026-08-01", to_date="2026-09-30",
+             label="Groceries"),
+        lambda: say(f"August £{aug_groceries}, September £{sep_groceries}; dataset {latest_dataset()}."),
+        lambda: call("task", subagent_type="chart-agent", description=f"Draw dataset {latest_dataset()} as columns."),
+        lambda: call("column_chart", dataset_id=latest_dataset()),
+        say("Drew a column chart."),
+        say(f"Here's your grocery spending by month: £{aug_groceries} in August and £{sep_groceries} in September 2026.")])
+    monthly = [r for r in chart["outputs"]["tool_results"] if '"by_month"' in r]
+    drawn = [r for r in chart["outputs"]["tool_results"] if '"form": "column"' in r]
+    check("a chart request: both months' totals in one call, matching the oracle, then drawn",
+          passed(chart["scores"]) and monthly and aug_groceries.replace(",", "") in monthly[0]
+          and sep_groceries.replace(",", "") in monthly[0] and drawn)
 
     transfer = await score("write-transfer-small", [
         call("task", subagent_type="accounts-agent", description="Transfer £50 from current to savings"),

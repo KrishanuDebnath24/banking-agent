@@ -90,7 +90,18 @@ def said(text):
 
 
 # Every agent (one per person, per app copy) takes its next reply from this one script, in test order.
-SCRIPT = iter([
+def _play(items):
+    """The script, with some replies worked out when they're used (a dataset id the bank just made)."""
+    for item in items:
+        yield item() if callable(item) else item
+
+
+def latest_dataset() -> str:
+    with storage.CHARTS.connect() as db:
+        return db.execute("SELECT dataset_id FROM chart_datasets ORDER BY created DESC LIMIT 1").fetchone()[0]
+
+
+SCRIPT = _play([
     # Robert (owner, A): balances
     call("task", subagent_type="accounts-agent", description="List the customer's balances."),
     call("list_my_accounts"), said("current £5,234.77, savings £1,201.12"),
@@ -121,6 +132,24 @@ SCRIPT = iter([
     call("task", subagent_type="service-agent", description="Change address to 1 New Street, Leeds LS1 1AA."),
     call("change_address", new_address="1 New Street, Leeds LS1 1AA"),
     said("Changed."), said("Your address is now 1 New Street, Leeds LS1 1AA."),
+    # Chloe (visitor): a chart takes two specialists: the figures, then the drawing
+    call("task", subagent_type="transactions-agent", description="Grocery spending for each month, for a chart."),
+    call("spending_by_month", category="groceries", label="Groceries"),
+    lambda: said(f"Monthly grocery totals saved as dataset {latest_dataset()}."),
+    lambda: call("task", subagent_type="chart-agent", description=f"Draw dataset {latest_dataset()} as columns."),
+    lambda: call("column_chart", dataset_id=latest_dataset()),
+    said("Drew a column chart."), said("Here's your grocery spending by month."),
+    # Chloe: the same figures as a line: only the chart specialist, the bank isn't asked again
+    lambda: call("task", subagent_type="chart-agent", description=f"Draw dataset {latest_dataset()} as a line."),
+    lambda: call("line_chart", dataset_id=latest_dataset()),
+    said("Drew a line chart."), said("Here it is as a line."),
+    # Chloe: where her money goes, as a donut
+    call("task", subagent_type="transactions-agent", description="Spending by category, for a donut chart."),
+    call("spending_breakdown", by="category"),
+    lambda: said(f"Spending by category saved as dataset {latest_dataset()}."),
+    lambda: call("task", subagent_type="chart-agent", description=f"Draw dataset {latest_dataset()} as a donut."),
+    lambda: call("donut_chart", dataset_id=latest_dataset()),
+    said("Drew a donut chart."), said("Here's where your money goes."),
 ])
 
 
@@ -268,6 +297,12 @@ async def owner_flow(app) -> str:
         r = await ask(a, "Order a cheque book for my current account", thread)
         check("cheque book waits on its slip", r["status"] == "needs_confirmation"
               and r["slip"]["title"] == "Order a cheque book")
+        mine = (await a.get("/api/conversations")).json()["conversations"]
+        check("your conversations: titled with the first message, and marked as waiting for an approval",
+              mine and mine[0]["thread_id"] == thread and mine[0]["title"] == "What are my balances?"
+              and mine[0]["waiting"] is True and mine[0]["updated"] > time.time() - 60)
+        check("... Anil's list doesn't show Robert's conversations",
+              all(c["thread_id"] != thread for c in (await b.get("/api/conversations")).json()["conversations"]))
         before_requests = len(await requests_of("fake-token-A"))
 
         # A second copy of the app (a restart, or autoscaling): same database, nothing in memory.
@@ -376,6 +411,15 @@ async def visitor_flow(app, owner_thread: str) -> None:
         r = await robert.post("/api/chat", json={"message": "my card is 4111 1111 1111 1111"})
         check("... the owner isn't limited", r.status_code == 202)
         await wait(robert, r.json()["turn_id"])
+        listed = (await robert.get("/api/conversations")).json()["conversations"]
+        check("a new conversation goes to the top of the list, its title without the card number",
+              listed[0]["thread_id"] == r.json()["thread_id"] and "4111" not in listed[0]["title"]
+              and "card" in listed[0]["title"] and listed[1]["thread_id"] == owner_thread)
+        with storage.WEB.connect() as db:   # as if from before the list existed
+            db.execute("DELETE FROM chat_threads WHERE thread_id=?", (owner_thread,))
+        listed = (await robert.get("/api/conversations")).json()["conversations"]
+        check("... a conversation from before the list existed gets its title from its first message",
+              any(c["thread_id"] == owner_thread and c["title"] == "What are my balances?" for c in listed))
         os.environ["DAILY_SPEND_CAP_USD"] = "2.00"
 
         os.environ["GUEST_SIGNUPS_PER_IP_HOUR"] = "1"
@@ -402,6 +446,7 @@ async def visitor_flow(app, owner_thread: str) -> None:
         hist = (await sam.get(f"/api/history?thread_id={thread}")).json()
         check("reset: new activity, conversations and requests cleared",
               r.status_code == 200 and hist["messages"] == [] and await requests_of(token) == []
+              and (await sam.get("/api/conversations")).json()["conversations"] == []
               and GUEST_BANK.transactions(token, BANK_ID, GUEST_BANK.accounts_of(guest.guest_id)["current"]) != old_rows)
         check("the owner has no reset", (await robert.post("/api/guest/reset")).status_code == 404)
 
@@ -421,6 +466,8 @@ async def verified_visitor_and_expiry(app) -> None:
         check("... and her address changes in her bank", r["status"] == "answered"
               and profile["address"] == "1 New Street, Leeds LS1 1AA" and len(await requests_of(vera.token)) == 1)
 
+        from mcp_servers import datasets
+        vera_figures = datasets.save(f"guest:{vera.guest_id}", "monthly", {"label": "test"})
         with storage.GUESTS.connect() as db:   # 24 hours later
             db.execute("UPDATE guest_customers SET expires=? WHERE guest_id=?", (time.time() - 1, vera.guest_id))
         cp = None
@@ -436,8 +483,15 @@ async def verified_visitor_and_expiry(app) -> None:
         with storage.REQUESTS.connect() as db:
             reqs = db.execute("SELECT COUNT(*) FROM service_requests WHERE username=?",
                               (f"guest:{vera.guest_id}",)).fetchone()[0]
-        check("... with their conversations, requests and bank", cp is not None and gone is None and turns == 0
-              and reqs == 0 and GUEST_BANK.get(vera.guest_id) is None)
+        check("... with their conversations, requests, figures saved for charts, and bank",
+              cp is not None and gone is None and turns == 0 and reqs == 0 and GUEST_BANK.get(vera.guest_id) is None
+              and datasets.load(f"guest:{vera.guest_id}", vera_figures) is None)
+        old = datasets.save("robert.uk.29@example.com", "monthly", {"label": "test"})
+        with storage.CHARTS.connect() as db:
+            db.execute("UPDATE chart_datasets SET created=? WHERE dataset_id=?", (time.time() - 8 * 86400, old))
+        done = await app.state.maintenance_once()
+        check("housekeeping deletes figures saved for charts after 7 days", done["old_chart_data"] >= 1
+              and datasets.load("robert.uk.29@example.com", old) is None)
 
     with storage.OTP.connect() as db:
         codes_before = db.execute("SELECT COUNT(*) FROM challenges").fetchone()[0]
@@ -456,6 +510,135 @@ async def verified_visitor_and_expiry(app) -> None:
     found = state.get_turn(turn_id)
     check("housekeeping: an answer left running by a stopped copy is marked failed, with a message",
           found["status"] == "failed" and "restarted" in found["result"]["error"])
+
+
+async def chart_flow(app) -> None:
+    """Charts: the transactions specialist saves the figures (a dataset id), the chart specialist
+    draws that id. A different form of the same chart needs only the chart specialist."""
+    from datetime import date, timedelta
+
+    from api import charts
+    async with client(app, ip="198.51.100.30") as c:
+        await c.post("/api/login", json={"email": "chloe@example.org"})
+        guest = GUEST_BANK.active("chloe@example.org")
+        token = guest.token
+
+        r1 = await ask(c, "Can you generate me a chart of grocery spending each month for the whole year?")
+        thread = r1["thread_id"]
+        chart1 = (r1.get("charts") or [None])[0]
+        tools1 = [s["name"] for s in r1["steps"] if s["kind"] == "tool"]
+        who1 = [s["name"] for s in r1["steps"] if s["kind"] == "specialist"]
+        ds = next(s["args"]["dataset_id"] for s in r1["steps"] if s["name"] == "column_chart")
+        check("a chart: the transactions specialist saves the figures, then the chart specialist draws them",
+              r1["status"] == "answered" and who1 == ["transactions-agent", "chart-agent"]
+              and tools1 == ["spending_by_month", "column_chart"] and chart1 and chart1["form"] == "column")
+        r2 = await ask(c, "Show that as a line chart", thread)
+        chart2 = (r2.get("charts") or [None])[0]
+        check("... another form of the same figures: only the chart specialist, the bank isn't asked again",
+              r2["status"] == "answered" and [s["name"] for s in r2["steps"] if s["kind"] == "specialist"] == ["chart-agent"]
+              and [(s["name"], s["args"]) for s in r2["steps"] if s["kind"] == "tool"] == [("line_chart", {"dataset_id": ds})]
+              and chart2 and chart2["form"] == "line"
+              and (chart2["labels"], chart2["series"]) == (chart1["labels"], chart1["series"]))
+        r3 = await ask(c, "Where does my money go? Show me a donut", thread)
+        chart3 = (r3.get("charts") or [None])[0]
+        check("a breakdown by category as a donut: at most 6 slices, the rest as Other",
+              r3["status"] == "answered" and chart3 and chart3["form"] == "donut" and chart3["axis"] == "name"
+              and 2 <= len(chart3["labels"]) <= 6 and "Groceries" in chart3["labels"])
+        hist = (await c.get(f"/api/history?thread_id={thread}")).json()
+        drawn = [m.get("charts") for m in hist["messages"] if m["role"] == "bank"]
+        check("after a reload each chart is still under its answer",
+              drawn == [r1["charts"], r2["charts"], r3["charts"]])
+
+        # ---- the figures (transactions server) ----
+        groceries = await tool(token, "transactions", "spending_by_month", {"category": "groceries"})
+        summary = await tool(token, "transactions", "summarize_spending", {"category": "groceries"})
+        today = date.today()
+        first = date.fromisoformat(groceries["records_start"])
+        expected, m = [], first.replace(day=1)
+        while m <= today:
+            expected.append(m.strftime("%Y-%m"))
+            m = (m + timedelta(days=32)).replace(day=1)
+        check("monthly figures: every month from where the records start to this month, none missing",
+              groceries["months"] == expected and len(expected) >= 2)
+        check("... the same total as the spending summary, and the chart drew exactly these",
+              groceries["total"] == summary["totals"]["money_out"] > 0
+              and chart1["series"][0]["values"] == groceries["series"][0]["by_month"])
+        check("... part months marked, and this month flagged as only so far",
+              (expected[0] in groceries["partial"]) == (first.day != 1) and "this_month_so_far" in groceries
+              and "so far" in groceries["partial"].get(expected[-1], "so far"))
+        rows = GUEST_BANK.transactions(token, BANK_ID, GUEST_BANK.accounts_of(guest.guest_id)["savings"]) + \
+            GUEST_BANK.transactions(token, BANK_ID, GUEST_BANK.accounts_of(guest.guest_id)["current"])
+        own = [t for t in rows if t["details"]["description"] == "Monthly saving"]
+        real_in = round(sum(float(t["details"]["value"]["amount"]) for t in rows
+                            if float(t["details"]["value"]["amount"]) > 0
+                            and t["details"]["description"] != "Monthly saving"), 2)
+        income = await tool(token, "transactions", "spending_by_month", {"money": "in"})
+        check("income by month leaves out money moved between her own accounts (the £200 monthly saving)",
+              own and income["total"] == real_in and income["own_transfers_left_out"]["count"] == len(own) // 2)
+        everything = await tool(token, "transactions", "summarize_spending", {})
+        real_out = round(-sum(float(t["details"]["value"]["amount"]) for t in rows
+                              if float(t["details"]["value"]["amount"]) < 0
+                              and t["details"]["description"] != "Monthly saving"), 2)
+        check("... and so does total spending", everything["totals"]["money_out"] == real_out
+              and everything["own_transfers_left_out"]["count"] == len(own))
+        older = await tool(token, "transactions", "spending_by_month",
+                           {"category": "groceries", "from_date": (today - timedelta(days=400)).isoformat()})
+        check("asked for more than the records hold: starts where they start, and says so",
+              older["months"][0] == expected[0] and groceries["records_start"] in older["note"])
+        both = await tool(token, "transactions", "spending_by_month", {"category": "groceries, eating out"})
+        check("two categories at once: one line of figures each",
+              [x["name"] for x in both["series"]] == ["Groceries", "Eating out"] and both["dataset_id"] != ds)
+        backwards = await tool(token, "transactions", "spending_by_month",
+                               {"from_date": "2026-10-01", "to_date": "2026-09-01"})
+        check("dates the wrong way round are refused, and say so",
+              backwards["error"] == "invalid_input" and "wrong way round" in backwards["message"])
+        check("unknown categories and odd requests are refused plainly",
+              (await tool(token, "transactions", "spending_by_month", {"category": "lottery"}))["error"] == "invalid_input"
+              and (await tool(token, "transactions", "spending_by_month", {"money": "sideways"}))["error"] == "invalid_input"
+              and (await tool(token, "transactions", "spending_by_month",
+                              {"category": "groceries,coffee,rent,gym,bills"}))["error"] == "invalid_input"
+              and (await tool(token, "transactions", "spending_by_month", {"account": "joint"}))["error"] == "access_denied")
+        shops = await tool(token, "transactions", "spending_breakdown", {"by": "payee", "category": "groceries"})
+        check("a breakdown of one category by shop: only grocers, biggest first",
+              shops["items"] and all(categories_of(i["name"]) == "groceries" for i in shops["items"])
+              and [i["total"] for i in shops["items"]] == sorted((i["total"] for i in shops["items"]), reverse=True))
+
+        # ---- the drawing (chart server) ----
+        stacked = await tool(token, "charts", "stacked_column_chart", {"dataset_id": both["dataset_id"]})
+        check("stacked columns of two categories", stacked["chart"]["form"] == "stacked"
+              and len(stacked["chart"]["series"]) == 2 and charts.check(stacked["chart"]) is not None)
+        wrong = await tool(token, "charts", "donut_chart", {"dataset_id": ds})
+        check("a donut of month-by-month figures doesn't fit: it says which forms do",
+              wrong["error"] == "wrong_form" and "line_chart" in wrong["forms_that_fit"])
+        single = await tool(token, "charts", "stacked_column_chart", {"dataset_id": ds})
+        check("stacking a single category is refused", single["error"] == "wrong_form")
+        bars = await tool(token, "charts", "bar_chart", {"dataset_id": shops["dataset_id"], "top": 3})
+        check("ranked bars of a breakdown, the rest as Other",
+              bars["chart"]["labels"][-1] == "Other" and len(bars["chart"]["labels"]) == 4
+              and round(sum(bars["chart"]["series"][0]["values"]), 2) == shops["total"])
+        check("someone else's figures can't be drawn, even with the right id",
+              (await tool("fake-token-A", "charts", "column_chart", {"dataset_id": ds}))["error"] == "not_found"
+              and (await tool(token, "charts", "column_chart", {"dataset_id": "ds-00000000"}))["error"] == "not_found")
+        await c.post("/api/guest/reset")
+        check("Start over deletes the saved figures too",
+              (await tool(token, "charts", "column_chart", {"dataset_id": ds}))["error"] == "not_found")
+
+    good = {"form": "column", "axis": "month", "labels": ["2026-08", "2026-09"],
+            "series": [{"name": "Groceries", "values": [1.5, 2.0], "counts": [1, 2]}]}
+    odd = [{**good, "form": "pie"}, {**good, "labels": ["2026-08"]},
+           {**good, "series": [{"name": "x", "values": [1.0, -2.0]}]},
+           {**good, "series": [{"name": "x", "values": [1.0]}]}, {**good, "form": "donut"},
+           {**good, "labels": ["2026-13", "2026-09"]}]
+    check("charts: drawn only from chart tools, never from an error or odd data",
+          charts.check(good) is not None and all(charts.check(x) is None for x in odd)
+          and charts.from_tool("spending_by_month", json.dumps({"chart": good})) is None
+          and charts.from_tool("column_chart", '{"error": "not_found"}') is None
+          and charts.from_tool("column_chart", "not json") is None)
+
+
+def categories_of(description: str) -> str | None:
+    from obp.categories import category_of
+    return category_of(description, money_in=False)
 
 
 async def shutdown() -> None:
@@ -538,6 +721,23 @@ async def real_sign_in(app, owner_thread: str) -> None:
               and q["code_challenge_method"] == "S256" and q["state"] and q["nonce"] and q["scope"] == "openid email profile")
         check("... remembering the attempt in a short-lived HttpOnly cookie",
               "httponly" in oauth_cookie and "path=/api/auth" in oauth_cookie and "samesite=lax" in oauth_cookie)
+        # On AWS the app is reached through CloudFront and API Gateway, so the address it sees (http, an
+        # internal host) is never PUBLIC_URL. It must still send people straight to Google (a redirect to
+        # itself here looped forever on the first AWS deploy).
+        os.environ["PUBLIC_URL"] = "https://d1234abcd.cloudfront.net"
+        behind_proxy = await c.get("/api/auth/google")
+        proxied = {k: v[0] for k, v in parse_qs(urlsplit(behind_proxy.headers["location"]).query).items()}
+        check("behind CloudFront: straight to Google, with the public https return address (no redirect loop)",
+              urlsplit(behind_proxy.headers["location"]).netloc == "accounts.google.com"
+              and proxied["redirect_uri"] == "https://d1234abcd.cloudfront.net/api/auth/google/callback")
+        os.environ["PUBLIC_URL"] = "http://127.0.0.1:8000"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost:8000") as local:
+            hop = await local.get("/api/auth/google")
+        check("on your PC: opened as localhost, sent to 127.0.0.1 first (where Google returns)",
+              hop.headers["location"] == "http://127.0.0.1:8000/api/auth/google")
+        os.environ["PUBLIC_URL"] = "http://bank.test"
+        c.cookies.clear()
+        await c.get("/api/auth/google")   # a real start in this browser, then a return it didn't start
         r = await c.get("/api/auth/google/callback", params={"code": "x", "state": "made-up"})
         check("Google: a return that this browser didn't start is refused",
               r.headers["location"] == "/?signin_error=state" and (await c.get("/api/me")).status_code == 401)
@@ -671,6 +871,7 @@ async def main() -> int:
         owner_thread = await owner_flow(app)
         await visitor_flow(app, owner_thread)
         await verified_visitor_and_expiry(app)
+        await chart_flow(app)
         await real_sign_in(app, owner_thread)
         await only_through_cloudfront(app)
         async with client(app) as a:

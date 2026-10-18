@@ -99,6 +99,11 @@ CASES: list[Case] = [
     Case("statement-savings-sep", "statements", ["Give me a statement for my savings account for September 2026."],
          amounts=[m(f.balance("A", "savings", "2026-08-31")), m(f.balance("A", "savings", "2026-09-30"))],
          subagents=["transactions-agent"], tools=["get_statement"]),
+    Case("chart-groceries-monthly", "statements",
+         ["Show me a chart of my grocery spending for each month, August and September 2026."],
+         amounts=[m(f.spent("A", f.GROCERIES, *AUG)), m(f.spent("A", f.GROCERIES, *SEP))],
+         subagents=["transactions-agent", "chart-agent"], tools=["spending_by_month", "column_chart"],
+         rubric="The answer must not say charts can't be made: the chart specialist draws the saved monthly totals."),
     Case("list-early-sep", "statements", ["List the transactions on my current account from 1 to 5 September 2026."],
          amounts=["795.00", "63.20", "712.50", "10.99"], subagents=["transactions-agent"]),
 

@@ -4,6 +4,8 @@ request, and a restart or a new copy signs nobody out.
     web_sessions   who is signed in: the hash of the cookie's random id -> the person (never a bank token)
     chat_turns     each message being answered: running, then its steps and result
     chat_pending   actions waiting for the customer's approval, and the security code sent for one
+    chat_threads   the "Your conversations" list: each conversation's title (its first message,
+                   without card numbers, codes or contact details) and when it was last used
 
 Each change to one conversation runs in one short transaction holding that conversation's lock
 (db.lock), so two copies of the app can't both start an answer, or both approve one slip.
@@ -210,6 +212,7 @@ def finish_turn(turn_id: str, thread_id: str, owner_key: str, status: str, steps
             _put_pending(db, thread_id, owner_key, pending)
         elif status != "failed":
             db.execute("DELETE FROM chat_pending WHERE thread_id=?", (thread_id,))
+        db.execute("UPDATE chat_threads SET updated=? WHERE thread_id=?", (time.time(), thread_id))
 
 
 def get_turn(turn_id: str) -> dict | None:
@@ -220,6 +223,23 @@ def get_turn(turn_id: str) -> dict | None:
         return None
     return {"turn_id": turn_id, "thread_id": row[0], "owner_key": row[1], "status": row[2],
             "steps": json.loads(row[3]), "result": json.loads(row[4]) if row[4] else {}}
+
+
+def charts_of(thread_id: str) -> dict[str, list]:
+    """The charts drawn under this conversation's answers, by the answer's text, so the page can
+    show them again after a reload. (Turn records are kept for 7 days.)"""
+    with _db() as db:
+        rows = db.execute("SELECT result FROM chat_turns WHERE thread_id=? AND status='answered' ORDER BY created",
+                          (thread_id,)).fetchall()
+    out: dict[str, list] = {}
+    for (raw,) in rows:
+        try:
+            result = json.loads(raw) if raw else {}
+        except ValueError:
+            continue
+        if result.get("charts") and result.get("answer"):
+            out[result["answer"]] = result["charts"]
+    return out
 
 
 def running_turn(thread_id: str) -> str | None:
@@ -253,6 +273,7 @@ def threads_of(owner_key: str) -> list[str]:
     with _db() as db:
         rows = db.execute("SELECT DISTINCT thread_id FROM chat_turns WHERE owner_key=?", (owner_key,)).fetchall()
         rows += db.execute("SELECT thread_id FROM chat_pending WHERE owner_key=?", (owner_key,)).fetchall()
+        rows += db.execute("SELECT thread_id FROM chat_threads WHERE owner_key=?", (owner_key,)).fetchall()
     return sorted({r[0] for r in rows})
 
 
@@ -260,6 +281,58 @@ def forget_conversations(owner_key: str) -> None:
     with _db() as db:
         db.execute("DELETE FROM chat_turns WHERE owner_key=?", (owner_key,))
         db.execute("DELETE FROM chat_pending WHERE owner_key=?", (owner_key,))
+        db.execute("DELETE FROM chat_threads WHERE owner_key=?", (owner_key,))
+
+
+# ---------- the "Your conversations" list ----------
+
+def _title(message: str) -> str:
+    """A conversation's title: its first message, without card numbers, PINs, codes, passwords or
+    contact details (the same rules as the chat's guardrail), on one line."""
+    from guardrails import pii
+    text, _ = pii.redact(message, pii.INPUT_BLOCK)
+    text, _ = pii.redact(text, pii.INPUT_MASK)
+    text = " ".join(text.split())
+    return (text[:77].rstrip() + "…" if len(text) > 80 else text) or "Conversation"
+
+
+def note_thread(thread_id: str, owner_key: str, message: str) -> None:
+    """A message was sent: a new conversation gets its title; an old one moves to the top."""
+    now = time.time()
+    with _db() as db:
+        db.execute("INSERT INTO chat_threads (thread_id, owner_key, title, created, updated) VALUES (?,?,?,?,?)"
+                   " ON CONFLICT (thread_id) DO UPDATE SET updated=excluded.updated",
+                   (thread_id, owner_key, _title(message), now, now))
+
+
+def set_title(thread_id: str, owner_key: str, first_message: str, updated: float) -> str:
+    """A title for a conversation from before the list existed."""
+    title = _title(first_message)
+    with _db() as db:
+        db.execute("INSERT INTO chat_threads (thread_id, owner_key, title, created, updated) VALUES (?,?,?,?,?)"
+                   " ON CONFLICT (thread_id) DO NOTHING", (thread_id, owner_key, title, updated, updated))
+    return title
+
+
+def conversations_of(owner_key: str, limit: int = 20) -> list[dict]:
+    """This person's conversations, most recently used first. title is None for one from before the
+    list existed (the API fills it in from the conversation's first message)."""
+    with _db() as db:
+        rows = db.execute("SELECT thread_id, title, updated FROM chat_threads WHERE owner_key=?"
+                          " ORDER BY updated DESC LIMIT ?", (owner_key, limit)).fetchall()
+        older = db.execute("SELECT thread_id, MAX(updated) FROM chat_turns WHERE owner_key=? GROUP BY thread_id",
+                           (owner_key,)).fetchall()
+        waiting = {r[0] for r in db.execute("SELECT thread_id FROM chat_pending WHERE owner_key=?",
+                                            (owner_key,)).fetchall()}
+        running = {r[0] for r in db.execute("SELECT DISTINCT thread_id FROM chat_turns WHERE owner_key=?"
+                                            " AND status='running'", (owner_key,)).fetchall()}
+    titled = {r[0] for r in rows}
+    items = [{"thread_id": t, "title": title, "updated": u} for t, title, u in rows]
+    items += [{"thread_id": t, "title": None, "updated": u} for t, u in older if t not in titled]
+    items.sort(key=lambda c: -c["updated"])
+    for c in items:
+        c["waiting"], c["running"] = c["thread_id"] in waiting, c["thread_id"] in running
+    return items[:limit]
 
 
 def end_sessions_of(owner_key: str) -> None:

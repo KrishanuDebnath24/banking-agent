@@ -10,6 +10,8 @@ Settings come from ../.env (see settings.py). Passwords and keys never do.
 
 from __future__ import annotations
 
+import sys
+
 import aws_cdk as cdk
 
 from settings import Settings
@@ -17,6 +19,11 @@ from stacks.bank import BankStack
 from stacks.budget import BudgetStack
 
 settings = Settings.load()
+if not settings.account:   # the cdk command fills this in from your AWS sign-in
+    sys.exit("\nCan't tell which AWS account to use, so nothing was changed: the cdk command couldn't find\n"
+             "your AWS sign-in (it has probably run out). Run  aws login  and try again.\n"
+             "If it still says this, run this once in the same PowerShell window, then try again:\n"
+             "  aws configure export-credentials --format powershell | Invoke-Expression\n")
 env = cdk.Environment(account=settings.account, region=settings.region)
 app = cdk.App()
 

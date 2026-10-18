@@ -74,8 +74,9 @@ Offline test (no keys needed): `python tests/test_agent_offline.py`
 
 ```
 coordinator ──task──> accounts-agent      ── Accounts MCP     :8101  balances, own-account transfers
-            ──task──> transactions-agent  ── Transactions MCP :8102  history, totals, statements
+            ──task──> transactions-agent  ── Transactions MCP :8102  history, totals, monthly totals, statements
             ──task──> service-agent       ── Service MCP      :8103  profile, address, service requests
+            ──task──> chart-agent         ── Charts MCP       :8105  draws saved figures (no bank access)
 chat app  ──────────────────────────────────── Verify service   :8104  security codes (not MCP, not the AI)
 ```
 
@@ -106,7 +107,8 @@ python -m scripts.chat_multi --thread A-1a2b3c4d   # continue a saved conversati
 - Conversations and pending confirmations are saved in `sessions.db`.
 
 Try: "move £20 from current to savings", "move £600 from current to savings" (asks for a code),
-"what did I spend on groceries this month?", "give me a statement for my savings",
+"what did I spend on groceries this month?", "chart my grocery spending by month" (the web chat
+draws a bar chart from the bank's own monthly totals), "give me a statement for my savings",
 "I've moved to 12 Main Street, Maynooth, W23 X1Y2" (asks for a code), "what address do you have
 for me?", "order a cheque book", "what service requests do I have?", and as Robert ask for the
 balance of Anil's current account by its ID from `demo_accounts.json` (refused).
@@ -176,7 +178,7 @@ python -m scripts.cost_report --days 30      # per day, customer, agent, model, 
 
 ### Eval suite
 
-39 cases on a fixed fake bank (`evals/fixture.py`), so answers are known and transfers are safe:
+40 cases on a fixed fake bank (`evals/fixture.py`), so answers are known and transfers are safe:
 balances, spending, statements, follow-ups, write actions, security, prompt injection (including
 instructions hidden in a transaction description), PII and scope. Code checks the figures, the
 subagents and tools used, proposed actions, leaks, guardrails and efficiency; Claude Sonnet 5.5
@@ -206,6 +208,10 @@ Terminal 1: `python -m mcp_servers.run`   Terminal 2: `python -m api`   Then ope
   transfers from £500 ask for the emailed code on the slip itself.
 - "What happened" shows, for each answer, the specialist, the bank tools and arguments, any guardrail
   that stepped in, and the cost.
+- "Your conversations" (on the left; on a phone or tablet, behind the menu button) lists your recent
+  conversations, newest first, with "What happened" on the right. Each is
+  titled with its first message, with card numbers, codes and contact details taken out; open one to
+  carry on where you left off, charts and any waiting slip included. It survives signing out.
 - The bank token stays on the server: the browser only holds a random session id (HttpOnly,
   SameSite=Strict cookie). Customers can only open their own conversations. Security headers and a
   per-session rate limit are on.
@@ -217,6 +223,7 @@ Terminal 1: `python -m mcp_servers.run`   Terminal 2: `python -m api`   Then ope
 | `GET /api/turns/{turn_id}` | the answer so far: running (with live steps), answered, a slip, or failed |
 | `POST /api/confirm` | `{thread_id, approve, code?}` -> code needed, wrong code, next slip, or 202 and a `turn_id` |
 | `GET /api/history` | a conversation's messages, any slip still waiting, any answer still on its way |
+| `GET /api/conversations` | your recent conversations: title, last used, waiting for an approval or answering |
 | `POST /api/guest/reset` | visitors: new balances and activity, conversations cleared |
 | `GET /healthz` | health checks (the container's own) |
 
@@ -416,8 +423,8 @@ browser --https--> CloudFront --> API Gateway --VPC link--> Fargate task [ web c
   `python -m infra.app_secrets push` makes that secret for you (`ORIGIN_SECRET`).
 - **Opening hours** (`OPEN_HOURS`, Irish time): the database starts at 08:30 and stops at 17:10, the
   app starts at 08:45 and stops at 17:00. While open: 1 copy, up to 3 when busy (`APP_MAX_COPIES`).
-- **Invite-only** until step 6 adds the firewall: only `OWNER_EMAILS` and `INVITED_EMAILS` can sign in
-  (`OPEN_TO_PUBLIC=0`). Others aren't even sent a sign-in code.
+- **Invite-only** if you want it: with `OPEN_TO_PUBLIC=0` only `OWNER_EMAILS` and `INVITED_EMAILS` can sign
+  in, and others aren't even sent a sign-in code. `OPEN_TO_PUBLIC=1`: anyone.
 - The visitors' bank now uses the same single-transfer limit as yours (`OBP_MAX_TRANSFER`, £800).
 
 **Cost** (eu-west-1, open 8¼ hours a day, every day; checked October 2026):
@@ -459,6 +466,41 @@ Logs: `aws logs tail /banking-agent/app --follow` (app) and the `BankApp-ApiLogs
 Change the hours: edit `OPEN_HOURS`, then `cdk deploy BankApp` again. Remove it all: `cdk destroy BankApp`
 (the secret stays, $0.40 a month: `python -m infra.app_secrets delete` removes it too).
 
+## 14. Phase 4, step 6: charts
+
+Ask for a chart in the web chat ("chart my grocery spending by month", "show that as a line",
+"where does my money go? as a donut") and it appears under the answer.
+
+```
+coordinator --task--> transactions-agent --> Transactions MCP: works out the figures, saves them
+                                                 as a dataset (ds-4f2a9c1e), returns only the id
+            --task--> chart-agent        --> Charts MCP :8105: opens that id (this customer's only)
+                                                 and returns a chart; no bank access
+web API     copies the chart from the chart tool's result (never from the AI's words) --> the page draws it
+```
+
+- **Two steps, one id.** The figures come from the transactions server's code; only the dataset id
+  passes through the AI. "Show that as a line" goes straight to the chart agent with the same id:
+  the bank isn't asked again.
+- **Forms.** Month by month: `column_chart` (several categories side by side), `line_chart` (up to 3
+  lines), `stacked_column_chart` (2-4 categories). A breakdown by category or shop: `bar_chart`
+  (ranked; the rest as "Other"), `donut_chart` (5 slices and "Other"). A form that doesn't fit the
+  figures is refused with the forms that do.
+- **Categories** live in one place, `obp/categories.py` (groceries, eating out, coffee, transport,
+  subscriptions, bills, gym, rent, shopping; salary, invoices, interest). The AI names a category;
+  the bank servers know its payee words. `tests/test_categories.py` checks that every demo
+  transaction (visitors' banks, Robert and Anil, the eval bank, the fake bank) is in exactly one.
+- **Totals leave out transfers between your own accounts** (the same amount out of one and into the
+  other on the same day): moving money to savings is neither spending nor income. Lists and
+  statements still show them. A month that isn't over yet is marked "so far".
+- **Saved figures** are in the `chart_datasets` table (`CHART_DB` with SQLite). A visitor's go with
+  their bank (24 hours, or "Start over"); others are deleted after 7 days.
+
+No AWS changes: the charts server runs in the same container as the other bank servers.
+
+Offline checks: `python tests/test_categories.py`, and the chart conversation in
+`python tests/test_api_offline.py`.
+
 ## Layout
 
 ```
@@ -479,12 +521,17 @@ obp/fake.py                    in-memory fake bank (OBP_FAKE=1)
 mcp_servers/common.py          identity from the token, allowed accounts, filters
 mcp_servers/accounts/server.py      Accounts MCP server
 mcp_servers/transactions/server.py  Transactions MCP server
+mcp_servers/charts/server.py   Charts MCP server: draws saved figures (no bank access)
+mcp_servers/datasets.py        figures saved for charts, by id, per customer
+obp/categories.py              spending and income categories, and their payee words
+tests/test_categories.py       every demo transaction is in exactly one category
+api/charts.py                  checks a chart before the page draws it
 mcp_servers/services/server.py      Service MCP server
 mcp_servers/verification.py    security codes: email, checks, the verify service
 mcp_servers/run.py             start the servers
 scripts/check_codes.py         check code email + bank profile storage
 scripts/probe_challenge.py     showed OBP needs a second approver above the limit
-agents/coordinator.py          phase 2: Deep Agents coordinator + 3 subagents
+agents/coordinator.py          Deep Agents coordinator + 4 subagents (accounts, transactions, service, charts)
 scripts/chat_multi.py          phase 2 terminal chat with confirmations
 tests/test_multi_agent_offline.py  phase 2 end-to-end test
 guardrails/pii.py              deterministic PII detection and masking
@@ -496,7 +543,7 @@ observability/tracing.py       PII redaction for LangSmith traces
 scripts/setup_guardrail.py     create/update the Bedrock guardrail
 scripts/cost_report.py         cost report from the ledger
 evals/fixture.py               the fixed eval bank and its oracle
-evals/cases.py                 the 39 eval cases
+evals/cases.py                 the 40 eval cases
 evals/harness.py               runs a case against the real agents
 evals/evaluators.py            code scorers + the Claude judge
 evals/run.py                   the eval CLI, gates, LangSmith experiments

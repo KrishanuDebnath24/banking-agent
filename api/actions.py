@@ -37,4 +37,4 @@ def slip(action: dict) -> dict:
 
 
 SPECIALISTS = {"accounts-agent": "Accounts specialist", "transactions-agent": "Transactions specialist",
-               "service-agent": "Service specialist"}
+               "service-agent": "Service specialist", "chart-agent": "Chart specialist"}

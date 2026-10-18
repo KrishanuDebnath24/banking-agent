@@ -35,9 +35,11 @@ DEMO.write_text(json.dumps({"bank_id": "gh.29.uk", "customers": {
           "income": "a-inc", "merchants": "a-mer", "funding": []},
     "B": {"username": "anil.uk.29@example.com", "currency": "GBP", "current": "b-cur", "savings": "b-sav",
           "income": "b-inc", "merchants": "b-mer", "funding": []}}}))
-TEST_ENV = {"BANK_TEST": "1", "TELEMETRY_DB": "off", "MCP_PORT_OFFSET": "200",  # own ports: 8301-8304
+TEST_ENV = {"BANK_TEST": "1", "TELEMETRY_DB": "off", "MCP_PORT_OFFSET": "200",  # own ports: 8301-8305
             "MCP_ACCOUNTS_URL": "http://127.0.0.1:8301/mcp", "MCP_TRANSACTIONS_URL": "http://127.0.0.1:8302/mcp",
-            "MCP_SERVICE_URL": "http://127.0.0.1:8303/mcp", "VERIFY_URL": "http://127.0.0.1:8304", "OBP_FAKE": "1", "DEMO_ACCOUNTS_FILE": str(DEMO),
+            "MCP_SERVICE_URL": "http://127.0.0.1:8303/mcp", "VERIFY_URL": "http://127.0.0.1:8304",
+            "MCP_CHARTS_URL": "http://127.0.0.1:8305/mcp", "CHART_DB": str(TMP / "charts.db"),
+            "OBP_FAKE": "1", "DEMO_ACCOUNTS_FILE": str(DEMO),
             "SERVICE_REQUESTS_FILE": str(TMP / "requests.jsonl"), "SERVICE_REQUESTS_DB": str(TMP / "requests.db"),
             "DATABASE_URL": "", "LANGSMITH_TRACING": "false",
             "EMAIL_BACKEND": "console", "OTP_OUTBOX": str(OUTBOX), "OTP_DB": str(TMP / "verification.db"),

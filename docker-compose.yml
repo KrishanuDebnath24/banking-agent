@@ -59,6 +59,7 @@ services:
       MCP_ACCOUNTS_URL: http://mcp:8101/mcp
       MCP_TRANSACTIONS_URL: http://mcp:8102/mcp
       MCP_SERVICE_URL: http://mcp:8103/mcp
+      MCP_CHARTS_URL: http://mcp:8105/mcp
       VERIFY_URL: http://mcp:8104
       API_HOST: 0.0.0.0
       PORT: "8000"

@@ -33,6 +33,8 @@ def configure_env() -> Path:
         "MCP_ACCOUNTS_URL": f"http://127.0.0.1:{8101 + PORT_OFFSET}/mcp",
         "MCP_TRANSACTIONS_URL": f"http://127.0.0.1:{8102 + PORT_OFFSET}/mcp",
         "MCP_SERVICE_URL": f"http://127.0.0.1:{8103 + PORT_OFFSET}/mcp",
+        "MCP_CHARTS_URL": f"http://127.0.0.1:{8105 + PORT_OFFSET}/mcp",
+        "CHART_DB": str(work / "charts.db"),   # figures saved for charts: the servers write, the API tidies
         "TELEMETRY_DB": "off",
         "EVAL_FIXTURE": str(fixture_file), "EVAL_DEMO": str(demo_file), "EVAL_WORK": str(work)})
     return work
@@ -42,7 +44,7 @@ def start_servers() -> subprocess.Popen:
     """Start the eval servers and wait until they accept connections. On failure, the error
     message includes the end of their log, so the reason is visible without opening a temp file."""
     work = Path(os.environ["EVAL_WORK"])
-    ports = [8101 + PORT_OFFSET, 8102 + PORT_OFFSET, 8103 + PORT_OFFSET, 8104 + PORT_OFFSET]
+    ports = [8101 + PORT_OFFSET, 8102 + PORT_OFFSET, 8103 + PORT_OFFSET, 8104 + PORT_OFFSET, 8105 + PORT_OFFSET]
     busy = [p for p in ports if _open(p)]
     if busy:
         raise RuntimeError(

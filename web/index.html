@@ -11,14 +11,19 @@
 </head>
 <body>
   <header class="bar">
-    <a class="brand" href="./" aria-label="Demo Bank assistant, start page">
-      <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-name">Demo Bank</span>
-      <span class="brand-sub">assistant</span>
-    </a>
+    <div class="bar-start">
+      <button class="menu-button" id="menu-button" type="button" aria-label="Your conversations"
+              aria-controls="convo-panel" aria-expanded="false" hidden>
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <a class="brand" href="./" aria-label="Demo Bank assistant, start page">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">Demo Bank</span>
+        <span class="brand-sub">assistant</span>
+      </a>
+    </div>
     <div class="who" id="who" hidden>
       <span id="who-name"></span>
-      <button class="link" id="new-chat" type="button"><span class="long">New conversation</span><span class="short">New chat</span></button>
       <button class="link" id="reset-bank" type="button" title="New balances and activity; conversations cleared" hidden><span class="long">Start over</span><span class="short">Reset</span></button>
       <button class="link" id="switch-customer" type="button" hidden><span class="long">Switch customer</span><span class="short">Switch</span></button>
       <button class="link" id="sign-out" type="button">Sign out</button>
@@ -71,6 +76,18 @@
   </main>
 
   <main id="chat" class="chat" hidden>
+    <nav class="convo-panel" id="convo-panel" aria-label="Your conversations">
+      <div class="convo-head">
+        <h2>Your conversations</h2>
+        <button type="button" class="convo-close" id="convo-close" aria-label="Close the list">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+      <button type="button" class="convo-new" id="convo-new">+ New conversation</button>
+      <ul class="convo-list" id="convos"></ul>
+    </nav>
+    <div class="scrim" id="scrim" hidden></div>
+
     <section class="conversation" aria-label="Conversation">
       <p class="notice" id="notice" hidden></p>
       <div class="log" id="log" aria-live="polite">
@@ -80,6 +97,7 @@
           <div class="suggestions">
             <button type="button" class="suggestion">What are my balances?</button>
             <button type="button" class="suggestion">How much did I spend on groceries last month?</button>
+            <button type="button" class="suggestion">Chart my grocery spending by month</button>
             <button type="button" class="suggestion">Move £20 from current to savings</button>
           </div>
         </div>

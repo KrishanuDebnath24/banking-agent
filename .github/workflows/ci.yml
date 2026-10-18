@@ -31,6 +31,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      - run: python tests/test_categories.py
       - run: python tests/test_guardrails.py
       - run: python tests/test_agent_offline.py
       - run: python tests/test_multi_agent_offline.py

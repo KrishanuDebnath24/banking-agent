@@ -21,10 +21,11 @@ Endpoints (JSON, cookie session)
     POST /api/logout
     GET  /api/me
     POST /api/chat     {message, thread_id?}     -> 202 {turn_id}: the answer comes later
-    GET  /api/turns/{turn_id}                    -> running (with the steps so far) | answered |
-                                                    needs_confirmation | failed
+    GET  /api/turns/{turn_id}                    -> running (with the steps so far) | answered (with
+                                                    any charts, api/charts.py) | needs_confirmation | failed
     POST /api/confirm  {thread_id, approve, code?}  -> 200 code needed / next slip, or 202 {turn_id}
     GET  /api/history?thread_id=...
+    GET  /api/conversations                      the person's recent conversations, newest first
     POST /api/guest/reset                        visitors: new balances, conversations cleared
 
 Send, then check back
@@ -67,6 +68,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from dotenv import load_dotenv
@@ -80,9 +82,10 @@ if os.environ.get("BANK_TEST") != "1":
     load_dotenv(ROOT / ".env", override=True)
 
 import storage  # noqa: E402
-from api import signin, state  # noqa: E402
+from api import charts, signin, state  # noqa: E402
 from api.actions import SPECIALISTS, slip  # noqa: E402
 from api.state import Pending, Person  # noqa: E402
+from mcp_servers import datasets  # noqa: E402
 from obp import guest_bank  # noqa: E402
 from obp.guest_bank import GUEST_BANK  # noqa: E402
 from observability import costs  # noqa: E402
@@ -103,6 +106,7 @@ COULDNT_FINISH = "I couldn't finish that just now. Please try again."
 BANK_DOWN = "The bank service isn't reachable right now. Please try again in a minute."
 THREAD_RE = re.compile(r"^(A|B|g[0-9a-f]{10})-[0-9a-f]{8}$")
 TURN_RE = re.compile(r"^[0-9a-f]{16}$")
+LOOPBACK = {"localhost", "127.0.0.1", "::1", "[::1]"}
 EMAIL_RE = re.compile(r"^[^@\s<>\"']{1,64}@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,24}$")
 log = logging.getLogger("bank.api")
 
@@ -305,7 +309,7 @@ def create_app(model_factory=None) -> FastAPI:
                         # The reason goes to the server log (docker compose logs api / CloudWatch).
                         log.exception("can't reach the bank servers (%s): %s", type(e).__name__,
                                       ", ".join(os.environ.get(k, "default") for k in
-                                                ("MCP_ACCOUNTS_URL", "MCP_TRANSACTIONS_URL", "MCP_SERVICE_URL")))
+                                                ("MCP_ACCOUNTS_URL", "MCP_TRANSACTIONS_URL", "MCP_SERVICE_URL", "MCP_CHARTS_URL")))
                         raise BankUnavailable() from e
                     entry = agents[p.owner_key] = AgentEntry(agent, time.time())
         entry.last_used = time.time()
@@ -365,8 +369,9 @@ def create_app(model_factory=None) -> FastAPI:
 
     # ---------- answering, in the background ----------
 
-    async def stream(agent, payload, config, steps: list, turn_id: str) -> None:
-        """Run the agent, saving each specialist and tool it uses as it happens (the page shows them)."""
+    async def stream(agent, payload, config, steps: list, turn_id: str, drawn: list) -> None:
+        """Run the agent, saving each specialist and tool it uses as it happens (the page shows them),
+        and keeping a chart for each bank result that makes one (api/charts.py)."""
         seen: set = set()
         specialist = None
         async for _ns, chunk in agent.astream(payload, config, stream_mode="updates", subgraphs=True):
@@ -376,6 +381,13 @@ def create_app(model_factory=None) -> FastAPI:
                     continue
                 msgs = data.get("messages", [])
                 for m in msgs if isinstance(msgs, list) else []:
+                    if getattr(m, "type", "") == "tool" and getattr(m, "name", "") in charts.CHART_TOOLS:
+                        key = ("result", getattr(m, "tool_call_id", None))
+                        if key not in seen:
+                            seen.add(key)
+                            chart = charts.from_tool(m.name, _text(m))
+                            if chart:
+                                drawn.append(chart)
                     for call in getattr(m, "tool_calls", None) or []:
                         key = (call.get("id"), call.get("name"), repr(call.get("args")))
                         if key in seen:
@@ -395,6 +407,7 @@ def create_app(model_factory=None) -> FastAPI:
     async def run_turn(turn_id: str, p: Person, thread_id: str, payload, new_message: bool) -> None:
         meter = costs.start_turn(thread_id, p.owner_key)
         steps: list = []
+        drawn: list = []
         status, result, pending = "failed", {"error": COULDNT_FINISH}, None
         config = {"configurable": {"thread_id": thread_id}}
         try:
@@ -408,13 +421,15 @@ def create_app(model_factory=None) -> FastAPI:
             run_config = {**config, "callbacks": [costs.CostCallback(meter)], "run_name": "banking_web_turn",
                           "tags": ["web", "visitor" if p.is_guest else f"customer-{p.subject}"],
                           "metadata": {"customer": p.owner_key, "thread_id": thread_id}}
-            await asyncio.wait_for(stream(agent, payload, run_config, steps, turn_id), TURN_TIMEOUT)
+            await asyncio.wait_for(stream(agent, payload, run_config, steps, turn_id, drawn), TURN_TIMEOUT)
             items = waiting(st := await agent.aget_state(config))
             if items:
                 pending = Pending(items=items)
                 status, result = "needs_confirmation", {"slip": slip(items[0][1])}
             else:
                 status, result = "answered", {"answer": _text(st.values["messages"][-1])}
+                if drawn:
+                    result["charts"] = drawn[-charts.MAX_CHARTS:]
         except BankUnavailable:
             result = {"error": BANK_DOWN}
         except TimeoutError:
@@ -475,6 +490,7 @@ def create_app(model_factory=None) -> FastAPI:
         await forget_conversations(owner_key)
         await asyncio.to_thread(state.end_sessions_of, owner_key)
         await asyncio.to_thread(state.forget_requests, guest_id)
+        await asyncio.to_thread(datasets.forget, f"guest:{guest_id}")   # figures saved for charts
         await asyncio.to_thread(GUEST_BANK.delete, [guest_id])
         agents.pop(owner_key, None)
 
@@ -485,6 +501,7 @@ def create_app(model_factory=None) -> FastAPI:
         done = await asyncio.to_thread(state.tidy, SESSION_IDLE_SECONDS, STALE_TURN_SECONDS)
         done["old_signin_codes"] = await asyncio.to_thread(signin.tidy)
         done["old_security_codes"] = await asyncio.to_thread(state.forget_old_codes)
+        done["old_chart_data"] = await asyncio.to_thread(datasets.tidy)
         now = time.time()
         busy = {t.get_name() for t in tasks.values()}
         for key in [k for k, e in agents.items() if now - e.last_used > AGENT_IDLE_SECONDS and k not in busy]:
@@ -599,8 +616,13 @@ def create_app(model_factory=None) -> FastAPI:
         public_only()
         if not signin.google_enabled():
             raise HTTPException(404, "Google sign-in isn't set up.")
-        here = f"{request.url.scheme}://{request.url.netloc}"
-        if here != signin.public_url():   # e.g. opened as localhost: start where Google will send them back
+        # On your PC: opened as localhost but PUBLIC_URL says 127.0.0.1 (or the other way round)? Start at
+        # PUBLIC_URL, so the cookie set here is still there when Google sends you back. Only for these local
+        # names: on AWS the app sees API Gateway's address, never the public one, and must not redirect.
+        public = urlsplit(signin.public_url())
+        here = request.url
+        if (here.hostname in LOOPBACK and public.hostname in LOOPBACK
+                and (here.hostname, here.port) != (public.hostname, public.port)):
             return RedirectResponse(f"{signin.public_url()}/api/auth/google", status_code=303)
         url, cookie = signin.google_start()
         response = RedirectResponse(url, status_code=303)
@@ -703,6 +725,7 @@ def create_app(model_factory=None) -> FastAPI:
             return JSONResponse({"detail": "Please approve or decline the waiting request first.",
                                  "thread_id": thread_id, "status": "needs_confirmation",
                                  "slip": slip(busy.pending.current or {})}, status_code=409)
+        await asyncio.to_thread(state.note_thread, thread_id, p.owner_key, body.message)
         launch(turn_id, p, thread_id, {"messages": [{"role": "user", "content": body.message}]}, True)
         return {"thread_id": thread_id, "turn_id": turn_id, "status": "running"}
 
@@ -787,6 +810,7 @@ def create_app(model_factory=None) -> FastAPI:
         except BankUnavailable as e:
             raise HTTPException(503, BANK_DOWN) from e
         st = await agent.aget_state({"configurable": {"thread_id": thread_id}})
+        drawn = await asyncio.to_thread(state.charts_of, thread_id)
         messages = []
         for m in (st.values or {}).get("messages", []):
             kind = getattr(m, "type", "")
@@ -794,11 +818,36 @@ def create_app(model_factory=None) -> FastAPI:
                 text = _text(m)
                 if text.strip():
                     messages.append({"role": "you" if kind == "human" else "bank", "text": text})
+                    if kind == "ai" and text in drawn:
+                        messages[-1]["charts"] = drawn[text]
         pending = await asyncio.to_thread(state.get_pending, thread_id)
         return {"thread_id": thread_id, "messages": messages,
                 "slip": slip(pending.current) if pending and pending.current else None,
                 "code": code_box(pending) if pending and pending.current else None,
                 "running_turn": await asyncio.to_thread(state.running_turn, thread_id)}
+
+    @app.get("/api/conversations")
+    async def conversations(request: Request):
+        """The person's recent conversations, newest first, for the list beside the chat: a title (the
+        first message, cleaned of card numbers, codes and contact details), when it was last used,
+        and whether it's waiting for an approval or still answering."""
+        p = await person(request, count=True)
+        items = await asyncio.to_thread(state.conversations_of, p.owner_key)
+        untitled = [c for c in items if c["title"] is None]
+        if untitled:   # from before the list existed: the title comes from the conversation itself
+            try:
+                agent = await agent_for(p)
+                for c in untitled:
+                    st = await agent.aget_state({"configurable": {"thread_id": c["thread_id"]}})
+                    first = next((_text(m) for m in (st.values or {}).get("messages", [])
+                                  if getattr(m, "type", "") == "human" and _text(m).strip()), None)
+                    if first:
+                        c["title"] = await asyncio.to_thread(state.set_title, c["thread_id"], p.owner_key,
+                                                             first, c["updated"])
+            except BankUnavailable:
+                pass   # listed next time
+        return {"conversations": [{k: c[k] for k in ("thread_id", "title", "updated", "waiting", "running")}
+                                  for c in items if c["title"]]}
 
     @app.post("/api/guest/reset")
     async def guest_reset(request: Request):
@@ -813,6 +862,7 @@ def create_app(model_factory=None) -> FastAPI:
             raise HTTPException(401, "Your demo bank has expired. Sign in again for a new one.") from e
         await forget_conversations(p.owner_key)
         await asyncio.to_thread(state.forget_requests, p.subject)   # they were about the old bank
+        await asyncio.to_thread(datasets.forget, f"guest:{p.subject}")
         return {"ok": True, "expires": guest.expires}
 
     @app.get("/privacy")

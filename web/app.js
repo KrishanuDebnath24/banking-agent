@@ -7,7 +7,7 @@
   const els = {
     signIn: $("sign-in"), chat: $("chat"), customers: $("customers"), owners: $("owners"), who: $("who"),
     whoName: $("who-name"), log: $("log"), empty: $("empty"), form: $("composer"), input: $("message"),
-    send: $("send"), trace: $("trace"), newChat: $("new-chat"), signOut: $("sign-out"), resetBank: $("reset-bank"),
+    send: $("send"), trace: $("trace"), signOut: $("sign-out"), resetBank: $("reset-bank"),
     slipTemplate: $("slip-template"), notice: $("notice"), visitorForm: $("visitor-form"),
     visitorEmail: $("visitor-email"), visitorName: $("visitor-name"), visitorNote: $("visitor-note"),
     visitorGo: $("visitor-go"), visitorTerms: $("visitor-terms"), publicSignin: $("public-signin"),
@@ -16,6 +16,9 @@
     signinCodeLabel: $("signin-code-label"), codeGo: $("code-go"), codeRestart: $("code-restart"),
     publicNote: $("public-note"), choose: $("choose"), chooseTitle: $("choose-title"),
     chooseCustomers: $("choose-customers"), chooseNote: $("choose-note"), switchCustomer: $("switch-customer"),
+    convos: $("convos"), convoNew: $("convo-new"), menu: $("menu-button"), panel: $("convo-panel"),
+    scrim: $("scrim"), convoClose: $("convo-close"), conversation: document.querySelector(".conversation"),
+    traceAside: document.querySelector(".trace"),
   };
   let signinChallenge = null;
   const SIGNIN_ERRORS = {
@@ -135,6 +138,419 @@
     return out.join("");
   }
 
+  // ---------- charts: drawn from the bank's own figures (checked by api/charts.py first) ----------
+  // Forms: column (one set of figures; several stand side by side), stacked, line, bar (ranked,
+  // horizontal) and donut. One set of figures needs no legend (the title names it); several get one.
+  // Every value is also in the table under the chart, and on hover or keyboard focus. Names go in
+  // with textContent only. The colours are checked for colour-blind separation (adjacent pairs; the
+  // first three against each other, for lines that cross); "Other" is a quiet grey.
+  const SVG = "http://www.w3.org/2000/svg";
+  const svgEl = (name, attrs = {}) => {
+    const n = document.createElementNS(SVG, name);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    return n;
+  };
+  const COLORS = ["#008C7A", "#EB6834", "#6250D6", "#EDA100", "#2A78D6", "#E87BA4"];
+  const OTHER = "#A3B1B4";
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const LONG_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
+    "October", "November", "December"];
+  const monthOf = (key) => { const [y, m] = key.split("-").map(Number); return { y, m: m - 1 }; };
+  const dayText = (iso) => { const [y, m, d] = iso.split("-").map(Number); return `${d} ${MONTHS[m - 1]} ${y}`; };
+  const datesIn = (text) => String(text).replace(/\d{4}-\d{2}-\d{2}/g, dayText);
+  const isOther = (name) => String(name).toLowerCase() === "other";
+
+  function money(value, currency, compact = false) {
+    try {
+      return new Intl.NumberFormat("en-GB", compact
+        ? { style: "currency", currency, notation: "compact", maximumFractionDigits: 1 }
+        : { style: "currency", currency, minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+    } catch { return `${value.toFixed(2)} ${currency}`; }
+  }
+
+  let measurer = null;
+  function textWidth(text, el, size = 12, weight = 400) {   // how wide a label is in the page's font
+    measurer = measurer || document.createElement("canvas").getContext("2d");
+    measurer.font = `${weight} ${size}px ${getComputedStyle(el).fontFamily}`;
+    return measurer.measureText(text).width;
+  }
+
+  function fitText(text, width, el) {   // shorten with … rather than overflow
+    if (textWidth(text, el) <= width) return text;
+    let s = text;
+    while (s.length > 1 && textWidth(`${s}…`, el) > width) s = s.slice(0, -1);
+    return `${s.trimEnd()}…`;
+  }
+
+  function niceTicks(max) {
+    if (!(max > 0)) return [0, 10];
+    const rough = max / 4;
+    const mag = 10 ** Math.floor(Math.log10(rough));
+    const step = [1, 2, 2.5, 5, 10].map((f) => f * mag).find((s) => s >= rough);
+    const ticks = [];
+    for (let v = 0; v < max + step * 0.999; v += step) ticks.push(Math.round(v * 100) / 100);
+    if (ticks[ticks.length - 1] < max) ticks.push(ticks[ticks.length - 1] + step);
+    return ticks;
+  }
+
+  // A column with a rounded top (4px) and a square foot on the baseline.
+  function colPath(x0, x1, yb, yt, round = true) {
+    const r = round ? Math.min(4, yb - yt, (x1 - x0) / 2) : 0;
+    return `M${x0},${yb}V${yt + r}Q${x0},${yt} ${x0 + r},${yt}H${x1 - r}Q${x1},${yt} ${x1},${yt + r}V${yb}Z`;
+  }
+
+  function renderChart(chart) {
+    const cur = chart.currency || "GBP";
+    const labels = chart.labels || [];
+    const series = chart.series || [];
+    const form = chart.form;
+    const byMonth = chart.axis === "month";
+    const years = new Set(byMonth ? labels.map((k) => monthOf(k).y) : []);
+    const short = (k) => {
+      if (!byMonth) return k;
+      const { y, m } = monthOf(k);
+      return years.size > 1 ? `${MONTHS[m]} ${String(y).slice(2)}` : MONTHS[m];
+    };
+    const long = (k) => { if (!byMonth) return k; const { y, m } = monthOf(k); return `${LONG_MONTHS[m]} ${y}`; };
+    const notes = chart.notes || {};
+    const flag = (k) => (notes[k] ? "*" : "");
+    const seriesColor = (j) => COLORS[j % COLORS.length];
+    const sliceColor = (i) => (isOther(labels[i]) ? OTHER : form === "bar" ? COLORS[0] : COLORS[i % COLORS.length]);
+    const total = chart.total;
+    const paid = (n) => (n == null ? "" : ` · ${n} payment${n === 1 ? "" : "s"}`);
+
+    const fig = document.createElement("figure");
+    fig.className = `chart chart-${form}`;
+    const cap = document.createElement("figcaption");
+    const title = document.createElement("strong");
+    title.textContent = chart.title;
+    const sub = document.createElement("span");
+    const span = byMonth ? `${long(labels[0])} to ${long(labels[labels.length - 1])}`
+      : chart.period && chart.period.from ? `${dayText(chart.period.from)} to ${dayText(chart.period.to)}` : "";
+    sub.textContent = `Money ${chart.money === "in" ? "in" : "out"} · total ${money(total, cur)}${span ? ` · ${span}` : ""}`;
+    cap.append(title, sub);
+    fig.appendChild(cap);
+
+    if (series.length > 1) {   // several sets of figures: a legend, keyed like the marks
+      const legend = document.createElement("ul");
+      legend.className = "chart-legend";
+      series.forEach((s, j) => {
+        const li = document.createElement("li");
+        const key = document.createElement("span");
+        key.className = form === "line" ? "key line" : "key";
+        key.style.background = seriesColor(j);
+        li.append(key, document.createTextNode(s.name));
+        legend.appendChild(li);
+      });
+      fig.appendChild(legend);
+    }
+
+    const plot = document.createElement("div");
+    plot.className = "chart-plot";
+    const tip = document.createElement("div");
+    tip.className = "chart-tip"; tip.hidden = true; tip.setAttribute("aria-hidden", "true");
+    plot.appendChild(tip);
+    fig.appendChild(plot);
+
+    const foot = [...Object.entries(notes).map(([k, v]) => `${long(k)}: ${datesIn(v)}.`)];
+    if (chart.note) foot.push(datesIn(chart.note));
+    if (foot.length) {
+      const p = document.createElement("p");
+      p.className = "chart-note";
+      p.textContent = `${Object.keys(notes).length ? "* " : ""}${foot.join(" ")}`;
+      fig.appendChild(p);
+    }
+
+    // The table: every figure, without hovering.
+    const details = document.createElement("details");
+    details.className = "chart-table";
+    const summary = document.createElement("summary");
+    summary.textContent = "Show as a table";
+    const table = document.createElement("table");
+    const head = table.createTHead().insertRow();
+    const word = chart.money === "in" ? "Money in" : "Money out";
+    const first = byMonth ? "Month" : chart.by === "payee" ? (chart.money === "in" ? "Payer" : "Payee") : "Category";
+    const heads = series.length > 1 ? [first, ...series.map((s) => s.name), "Total"]
+      : [first, word, ...(byMonth ? [] : ["Share"]), ...(series[0].counts ? ["Payments"] : [])];
+    for (const h of heads) { const th = document.createElement("th"); th.textContent = h; head.appendChild(th); }
+    const body = table.createTBody();
+    labels.forEach((k, i) => {
+      const row = body.insertRow();
+      row.insertCell().textContent = byMonth ? `${MONTHS[monthOf(k).m]} ${monthOf(k).y}${notes[k] ? " *" : ""}` : k;
+      if (series.length > 1) {
+        series.forEach((s) => { row.insertCell().textContent = money(s.values[i], cur); });
+        row.insertCell().textContent = money(series.reduce((a, s) => a + s.values[i], 0), cur);
+      } else {
+        row.insertCell().textContent = money(series[0].values[i], cur);
+        if (!byMonth) row.insertCell().textContent = `${total ? Math.round((series[0].values[i] / total) * 100) : 0}%`;
+        if (series[0].counts) row.insertCell().textContent = String(series[0].counts[i] ?? "");
+      }
+    });
+    const foot2 = table.createTFoot().insertRow();
+    foot2.insertCell().textContent = "Total";
+    if (series.length > 1) series.forEach((s) => { foot2.insertCell().textContent = money(s.values.reduce((a, v) => a + v, 0), cur); });
+    foot2.insertCell().textContent = money(total, cur);
+    while (foot2.cells.length < heads.length) foot2.insertCell();
+    details.append(summary, table);
+    fig.appendChild(details);
+
+    // Hover and keyboard focus: one tip, every set of figures at that point.
+    function show(rows, x, el, y) {
+      tip.replaceChildren();
+      for (const r of rows) {
+        const line = document.createElement("div");
+        if (r.color) { const key = document.createElement("span"); key.className = "key"; key.style.background = r.color; line.appendChild(key); }
+        const v = document.createElement("strong"); v.textContent = r.value;
+        const l = document.createElement("span"); l.textContent = r.label;
+        line.append(v, l);
+        tip.appendChild(line);
+      }
+      tip.hidden = false;
+      if (byMonth) plot.classList.add("tipping");   // the tip covers the top: hide the peak's label under it
+      tip.style.top = y == null ? "" : `${Math.max(0, y - tip.offsetHeight - 4)}px`;
+      tip.style.left = `${Math.max(0, Math.min(plot.clientWidth - tip.offsetWidth, x - tip.offsetWidth / 2))}px`;
+      plot.querySelectorAll(".on").forEach((n) => n.classList.remove("on"));
+      el.classList.add("on");
+    }
+    function hide() { tip.hidden = true; plot.classList.remove("tipping"); plot.querySelectorAll(".on").forEach((n) => n.classList.remove("on")); }
+    function hover(el, rows, x, y) {
+      el.addEventListener("pointerenter", () => show(rows, x, el, y));
+      el.addEventListener("focus", () => show(rows, x, el, y));
+      el.addEventListener("pointerleave", hide);
+      el.addEventListener("blur", hide);
+    }
+    const monthRows = (i) => {
+      const rows = series.map((s, j) => ({ color: series.length > 1 ? seriesColor(j) : null, value: money(s.values[i], cur),
+        label: series.length > 1 ? s.name : `${long(labels[i])}${paid(s.counts && s.counts[i])}` }));
+      if (series.length > 1) rows.unshift({ value: money(series.reduce((a, s) => a + s.values[i], 0), cur), label: `${long(labels[i])}, all together` });
+      if (notes[labels[i]]) rows.push({ value: "", label: datesIn(notes[labels[i]]) });
+      return rows;
+    };
+
+    // Axes shared by the month forms: round-number gridlines and month labels that never touch.
+    function frame(svg, W, H, maxV, top, axisH) {
+      const ticks = niceTicks(maxV);
+      const ymax = ticks[ticks.length - 1];
+      const tickLabels = ticks.map((v) => money(v, cur, true));
+      const left = Math.min(64, 12 + Math.max(...tickLabels.map((s) => textWidth(s, plot))));
+      const y = (v) => top + (H - top) * (1 - v / ymax);
+      ticks.forEach((v, i) => {
+        svg.appendChild(svgEl("line", { x1: left, x2: W, y1: y(v), y2: y(v), class: i ? "grid" : "base" }));
+        const t = svgEl("text", { x: left - 8, y: y(v) + 4, class: "tick", "text-anchor": "end" });
+        t.textContent = tickLabels[i];
+        svg.appendChild(t);
+      });
+      return { left, y, ymax };
+    }
+    function monthLabels(g, i, cx, band, H) {
+      const widest = 10 + Math.max(...labels.map((k) => textWidth(`${short(k)}${flag(k)}`, plot)));
+      const every = Math.max(1, Math.ceil(widest / band));
+      if ((labels.length - 1 - i) % every !== 0) return;
+      const t = svgEl("text", { x: cx, y: H + 18, class: "month", "text-anchor": "middle" });
+      t.textContent = `${short(labels[i])}${flag(labels[i])}`;
+      g.appendChild(t);
+    }
+
+    function drawColumns(svg, W) {
+      const H = 190, axisH = 26, top = 22;
+      const stacked = form === "stacked";
+      const sums = labels.map((_, i) => series.reduce((a, s) => a + s.values[i], 0));
+      const maxV = stacked ? Math.max(...sums) : Math.max(...series.flatMap((s) => s.values));
+      const { left, y, ymax } = frame(svg, W, H, maxV, top, axisH);
+      const band = (W - left) / labels.length;
+      const n = series.length;
+      const grouped = !stacked && n > 1;
+      const barW = grouped ? Math.max(3, Math.min(16, (band * 0.78 - 2 * (n - 1)) / n)) : Math.max(6, Math.min(24, band * 0.6));
+      const peak = (stacked ? sums : series[0].values).reduce((b, v, i, a) => (v > a[b] ? i : b), 0);
+      labels.forEach((k, i) => {
+        const cx = left + band * (i + 0.5);
+        const g = svgEl("g", { class: "col", tabindex: "0", role: "img",
+          "aria-label": monthRows(i).map((r) => `${r.label}${r.value ? `: ${r.value}` : ""}`).join("; ") });
+        g.appendChild(svgEl("rect", { x: left + band * i, y: top - 18, width: band, height: H - top + 18 + axisH, class: "hit" }));
+        const scale = (v) => (H - top) * (v / ymax);
+        if (stacked) {
+          let base = 0;
+          const shown = series.map((s) => s.values[i]).map((v) => scale(v));
+          const last = shown.reduce((b, h, j) => (h > 0.5 ? j : b), -1);
+          series.forEach((s, j) => {
+            const h = shown[j];
+            if (h > 0.5) {
+              const yb = y(0) - base, yt = yb - h;
+              const gap = j < last ? Math.min(2, h / 2) : 0;   // a 2px sliver of background between segments
+              g.appendChild(svgEl("path", { class: "seg", fill: seriesColor(j),
+                d: colPath(cx - barW / 2, cx + barW / 2, yb, yt + gap, j === last) }));
+            }
+            base += h;
+          });
+        } else {
+          series.forEach((s, j) => {
+            const h = scale(s.values[i]);
+            if (h <= 0.5) return;
+            const x0 = grouped ? cx - (n * barW + 2 * (n - 1)) / 2 + j * (barW + 2) : cx - barW / 2;
+            g.appendChild(svgEl("path", { class: "seg", fill: seriesColor(j), d: colPath(x0, x0 + barW, y(0), y(0) - h) }));
+          });
+        }
+        monthLabels(g, i, cx, band, H);
+        if (i === peak && !grouped && (stacked ? sums[i] : series[0].values[i]) > 0) {   // label the highest only
+          const v = stacked ? sums[i] : series[0].values[i];
+          const t = svgEl("text", { x: cx, y: y(v) - 6, class: "value", "text-anchor": "middle" });
+          t.textContent = money(v, cur);
+          g.appendChild(t);
+        }
+        hover(g, monthRows(i), cx);
+        svg.appendChild(g);
+      });
+      return H + axisH;
+    }
+
+    function drawLine(svg, W) {
+      const H = 190, axisH = 26, top = 22;
+      const n = series.length;
+      const maxV = Math.max(...series.flatMap((s) => s.values));
+      // Names at the line ends only when they don't crowd each other; the legend is there either way.
+      const ticks = niceTicks(maxV), top2 = ticks[ticks.length - 1];
+      const endY = series.map((s) => top + (H - top) * (1 - s.values[s.values.length - 1] / top2)).sort((a, b) => a - b);
+      const roomy = n > 1 && endY.every((v, k) => k === 0 || v - endY[k - 1] >= 14);
+      const pad = roomy ? Math.min(120, 14 + Math.max(...series.map((s) => textWidth(s.name, plot)))) : 12;
+      const { left, y } = frame(svg, W - pad, H, maxV, top, axisH);
+      const band = (W - pad - left) / labels.length;
+      const xs = labels.map((_, i) => left + band * (i + 0.5));
+      const hair = svgEl("line", { x1: 0, x2: 0, y1: top - 8, y2: H, class: "hair" });
+      svg.appendChild(hair);
+      series.forEach((s, j) => {
+        svg.appendChild(svgEl("path", { class: "line", stroke: seriesColor(j),
+          d: s.values.map((v, i) => `${i ? "L" : "M"}${xs[i]},${y(v)}`).join("") }));
+      });
+      series.forEach((s, j) => {
+        const last = s.values.length - 1;
+        svg.appendChild(svgEl("circle", { cx: xs[last], cy: y(s.values[last]), r: 4, fill: seriesColor(j), class: "dot" }));
+        if (roomy) {
+          const t = svgEl("text", { x: xs[last] + 8, y: y(s.values[last]) + 4, class: "end" });
+          t.textContent = s.name;
+          svg.appendChild(t);
+        }
+      });
+      if (n === 1) {
+        const v = series[0].values;
+        const peak = v.reduce((b, x, i) => (x > v[b] ? i : b), 0);
+        if (v[peak] > 0) {
+          const t = svgEl("text", { x: xs[peak], y: y(v[peak]) - 10, class: "value", "text-anchor": "middle" });
+          t.textContent = money(v[peak], cur);
+          svg.appendChild(t);
+        }
+      }
+      labels.forEach((k, i) => {
+        const g = svgEl("g", { class: "col", tabindex: "0", role: "img",
+          "aria-label": monthRows(i).map((r) => `${r.label}${r.value ? `: ${r.value}` : ""}`).join("; ") });
+        g.appendChild(svgEl("rect", { x: xs[i] - band / 2, y: top - 18, width: band, height: H - top + 18 + axisH, class: "hit" }));
+        monthLabels(g, i, xs[i], band, H);
+        hover(g, monthRows(i), xs[i]);
+        g.addEventListener("pointerenter", () => { hair.setAttribute("x1", xs[i]); hair.setAttribute("x2", xs[i]); });
+        g.addEventListener("focus", () => { hair.setAttribute("x1", xs[i]); hair.setAttribute("x2", xs[i]); });
+        svg.appendChild(g);
+      });
+      return H + axisH;
+    }
+
+    function drawBars(svg, W) {
+      const values = series[0].values;
+      const counts = series[0].counts || [];
+      const rowH = 30, barH = 18;
+      const valueW = 10 + Math.max(...values.map((v) => textWidth(money(v, cur), plot)));
+      const nameW = Math.min(W * 0.42, 16 + Math.max(...labels.map((k) => textWidth(k, plot))));
+      const plotW = Math.max(40, W - nameW - valueW);
+      const maxV = Math.max(...values);
+      svg.appendChild(svgEl("line", { x1: nameW, x2: nameW, y1: 0, y2: rowH * labels.length, class: "base" }));
+      labels.forEach((k, i) => {
+        const yMid = rowH * i + rowH / 2;
+        const len = maxV ? (values[i] / maxV) * plotW : 0;
+        const share = total ? Math.round((values[i] / total) * 100) : 0;
+        const g = svgEl("g", { class: "row", tabindex: "0", role: "img",
+          "aria-label": `${k}: ${money(values[i], cur)}, ${share}%${paid(counts[i])}` });
+        g.appendChild(svgEl("rect", { x: 0, y: rowH * i, width: W, height: rowH, class: "hit" }));
+        const name = svgEl("text", { x: nameW - 8, y: yMid + 4, class: "name", "text-anchor": "end" });
+        name.textContent = fitText(k, nameW - 10, plot);
+        g.appendChild(name);
+        if (len > 0.5) {   // rounded at the value end, square at the baseline
+          const r = Math.min(4, len, barH / 2), x0 = nameW, x1 = nameW + len, y0 = yMid - barH / 2, y1 = yMid + barH / 2;
+          g.appendChild(svgEl("path", { class: "seg", fill: sliceColor(i),
+            d: `M${x0},${y0}H${x1 - r}Q${x1},${y0} ${x1},${y0 + r}V${y1 - r}Q${x1},${y1} ${x1 - r},${y1}H${x0}Z` }));
+        }
+        const v = svgEl("text", { x: nameW + len + 6, y: yMid + 4, class: "value" });
+        v.textContent = money(values[i], cur);
+        g.appendChild(v);
+        hover(g, [{ value: money(values[i], cur), label: `${k} · ${share}%${paid(counts[i])}` }], nameW + len / 2,
+              rowH * i);   // just above its row
+        svg.appendChild(g);
+      });
+      return rowH * labels.length + 4;
+    }
+
+    function drawDonut(svg, W) {
+      const values = series[0].values;
+      const counts = series[0].counts || [];
+      const side = W >= 440;
+      const size = Math.min(side ? 200 : 220, W);
+      const R = size / 2 - 4, r0 = R * 0.62, cx = size / 2, cy = size / 2;
+      let a = -Math.PI / 2;
+      const pt = (rad, ang) => `${cx + rad * Math.cos(ang)},${cy + rad * Math.sin(ang)}`;
+      values.forEach((v, i) => {
+        const share = total ? v / total : 0;
+        const a1 = a + share * 2 * Math.PI;
+        const big = a1 - a > Math.PI ? 1 : 0;
+        const pct = Math.round(share * 100);
+        const g = svgEl("g", { class: "slice", tabindex: "0", role: "img",
+          "aria-label": `${labels[i]}: ${money(v, cur)}, ${pct}%${paid(counts[i])}` });
+        g.appendChild(svgEl("path", { class: "seg", fill: sliceColor(i),
+          d: `M${pt(R, a)}A${R},${R} 0 ${big} 1 ${pt(R, a1)}L${pt(r0, a1)}A${r0},${r0} 0 ${big} 0 ${pt(r0, a)}Z` }));
+        const mid = (a + a1) / 2;
+        hover(g, [{ value: money(v, cur), label: `${labels[i]} · ${pct}%${paid(counts[i])}` }], cx + (R * 0.8) * Math.cos(mid));
+        svg.appendChild(g);
+        a = a1;
+      });
+      const t1 = svgEl("text", { x: cx, y: cy - 2, class: "centre", "text-anchor": "middle" });
+      t1.textContent = money(total, cur);
+      const t2 = svgEl("text", { x: cx, y: cy + 16, class: "tick", "text-anchor": "middle" });
+      t2.textContent = "total";
+      svg.append(t1, t2);
+      svg.setAttribute("width", size); svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+      // The key, beside the ring (or under it on a phone): each slice's name, amount and share.
+      plot.querySelector(".donut-key")?.remove();
+      const key = document.createElement("ul");
+      key.className = "donut-key";
+      labels.forEach((k, i) => {
+        const li = document.createElement("li");
+        const sw = document.createElement("span"); sw.className = "key"; sw.style.background = sliceColor(i);
+        const name = document.createElement("span"); name.className = "k"; name.textContent = k;
+        const amt = document.createElement("span"); amt.className = "v";
+        amt.textContent = `${money(values[i], cur)} · ${total ? Math.round((values[i] / total) * 100) : 0}%`;
+        li.append(sw, name, amt);
+        key.appendChild(li);
+      });
+      plot.classList.toggle("side", side);
+      plot.appendChild(key);
+      return size;
+    }
+
+    let drawnWidth = 0;
+    function draw() {
+      const W = Math.floor(plot.clientWidth);
+      if (!W || Math.abs(W - drawnWidth) < 2) return;
+      drawnWidth = W;
+      const svg = svgEl("svg", { width: W, role: "group",
+        "aria-label": `${chart.title}: ${form === "donut" ? "donut" : form === "bar" ? "bar" : form === "line" ? "line" : "column"} chart` });
+      const height = form === "line" ? drawLine(svg, W) : form === "bar" ? drawBars(svg, W)
+        : form === "donut" ? drawDonut(svg, W) : drawColumns(svg, W);
+      svg.setAttribute("height", height);
+      if (form !== "donut") svg.setAttribute("viewBox", `0 0 ${W} ${height}`);
+      plot.querySelector("svg")?.remove();
+      plot.insertBefore(svg, tip);
+    }
+    if ("ResizeObserver" in window) new ResizeObserver(draw).observe(plot);
+    requestAnimationFrame(draw);
+    return fig;
+  }
+
   // ---------- rendering ----------
   function scrollDown() { els.log.scrollTop = els.log.scrollHeight; }
 
@@ -146,6 +562,9 @@
     body.className = "text";
     if (role === "bank" && !opts.error) body.innerHTML = markdown(text);   // escaped inside markdown()
     else body.textContent = text;
+    for (const chart of opts.charts || []) {
+      if (chart && (chart.labels || []).length >= 2 && (chart.series || []).length) body.appendChild(renderChart(chart));
+    }
     wrap.appendChild(body);
     els.log.appendChild(wrap);
     scrollDown();
@@ -303,8 +722,103 @@
     if (data.thread_id) { threadId = data.thread_id; store.set(threadKey(), threadId); }
     if (data.steps || data.cost) addTrace(question, data);
     if (data.status === "needs_confirmation") renderSlip(data.slip);
-    else if (data.status === "answered") addMessage("bank", data.answer);
+    else if (data.status === "answered") addMessage("bank", data.answer, { charts: data.charts });
     else if (data.status === "failed") addMessage("bank", data.error || "I couldn't finish that. Please try again.", { error: true });
+    refreshConversations();
+  }
+
+  // ---------- your conversations: newest first; open one to carry on where you left off ----------
+  let conversations = [];
+  let showAllConvos = false;
+  const CONVOS_SHOWN = 8;
+
+  function whenText(ts) {
+    const d = new Date(ts * 1000), now = new Date();
+    const hm = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+    const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const days = Math.round((day(now) - day(d)) / 86400000);
+    if (days === 0) return `Today ${hm}`;
+    if (days === 1) return `Yesterday ${hm}`;
+    return `${d.getDate()} ${MONTHS[d.getMonth()]}${d.getFullYear() !== now.getFullYear() ? ` ${d.getFullYear()}` : ""}`;
+  }
+
+  function renderConversations() {
+    els.convos.replaceChildren();
+    if (!conversations.length) {
+      const li = document.createElement("li");
+      li.className = "convo-none";
+      li.textContent = "Your conversations will appear here.";
+      els.convos.appendChild(li);
+      return;
+    }
+    for (const c of showAllConvos ? conversations : conversations.slice(0, CONVOS_SHOWN)) {
+      const li = document.createElement("li");
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "convo";
+      if (c.thread_id === threadId) b.setAttribute("aria-current", "true");
+      const t = document.createElement("span"); t.className = "convo-title"; t.textContent = c.title;
+      const m = document.createElement("span"); m.className = `convo-meta${c.waiting ? " waiting" : ""}`;
+      m.textContent = whenText(c.updated) + (c.waiting ? " · waiting for you" : c.running ? " · answering" : "");
+      b.append(t, m);
+      b.title = c.title;
+      b.addEventListener("click", () => openConversation(c.thread_id));
+      li.appendChild(b);
+      els.convos.appendChild(li);
+    }
+    if (conversations.length > CONVOS_SHOWN) {
+      const li = document.createElement("li");
+      const more = document.createElement("button");
+      more.type = "button"; more.className = "text-button convo-more";
+      more.textContent = showAllConvos ? "Show fewer" : `Show all ${conversations.length}`;
+      more.addEventListener("click", () => { showAllConvos = !showAllConvos; renderConversations(); });
+      li.appendChild(more);
+      els.convos.appendChild(li);
+    }
+  }
+
+  async function refreshConversations() {
+    if (!me || me.choosing) return;
+    try { conversations = (await api("/api/conversations")).conversations || []; } catch { return; }
+    renderConversations();
+  }
+
+  async function openConversation(id) {
+    if (busy) return;
+    closeMenu(false);
+    if (id === threadId) { els.input.focus(); return; }
+    resetConversation(false);
+    store.set(threadKey(), id);
+    await restore();
+    renderConversations();
+    if (window.matchMedia("(max-width: 52rem)").matches) window.scrollTo({ top: 0 });
+    els.input.focus();
+  }
+
+  function newConversation() {
+    if (busy) return;
+    closeMenu(false);
+    resetConversation();
+    renderConversations();
+    els.input.focus();
+  }
+
+  // On narrower screens the list is a panel that slides in from the left (the menu button).
+  const narrow = window.matchMedia("(max-width: 64rem)");
+  function openMenu() {
+    if (!narrow.matches) return;
+    els.panel.classList.add("open");
+    els.scrim.hidden = false;
+    els.menu.setAttribute("aria-expanded", "true");
+    for (const el of [els.conversation, els.traceAside]) el.inert = true;   // the rest waits behind the panel
+    (els.panel.querySelector('.convo[aria-current="true"]') || els.convoClose).focus();
+  }
+  function closeMenu(focusButton = true) {
+    if (!els.panel.classList.contains("open")) return;
+    els.panel.classList.remove("open");
+    els.scrim.hidden = true;
+    els.menu.setAttribute("aria-expanded", "false");
+    for (const el of [els.conversation, els.traceAside]) el.inert = false;
+    if (focusButton) els.menu.focus();
   }
 
   function setComposer(on) { els.send.disabled = !on; }
@@ -339,6 +853,7 @@
     try {
       const started = await api("/api/chat", { message: text, thread_id: threadId });
       if (started.thread_id) { threadId = started.thread_id; store.set(threadKey(), threadId); }
+      refreshConversations();   // a new conversation appears in the list straight away
       if (started.httpStatus === 409 && started.status === "needs_confirmation") {
         addMessage("bank", started.detail, { error: true });
       } else {
@@ -371,7 +886,10 @@
     } catch { store.del(threadKey()); return; }
     threadId = data.thread_id;
     let lastQuestion = "";
-    for (const m of data.messages) { addMessage(m.role, m.text); if (m.role === "you") lastQuestion = m.text; }
+    for (const m of data.messages) {
+      addMessage(m.role, m.text, { charts: m.charts });
+      if (m.role === "you") lastQuestion = m.text;
+    }
     if (data.slip) renderSlip(data.slip, data.code);
     if (data.running_turn) {   // reloaded while an answer was on its way
       busy = true; setComposer(false);
@@ -392,6 +910,7 @@
   async function showSignIn(message) {
     me = null;
     els.chat.hidden = true; els.who.hidden = true; els.choose.hidden = true; els.signIn.hidden = false;
+    closeMenu(false); els.menu.hidden = true;
     await loadConfig();
     els.publicSignin.hidden = !isPublic();
     els.visitorForm.hidden = isPublic();
@@ -431,6 +950,7 @@
   // The owner (an address in OWNER_EMAILS) picks Robert or Anil, and can switch later.
   function showChooser() {
     els.signIn.hidden = true; els.chat.hidden = true; els.choose.hidden = false;
+    closeMenu(false); els.menu.hidden = true;
     els.who.hidden = me.choosing; els.chooseNote.textContent = "";
     els.chooseTitle.textContent = me.choosing ? `Welcome back, ${me.name}` : "Switch customer";
     els.chooseCustomers.replaceChildren(...(me.customers || []).map((c) => customerButton(c, async () => {
@@ -453,13 +973,17 @@
 
   async function showChat() {
     els.signIn.hidden = true; els.choose.hidden = true; els.chat.hidden = false; els.who.hidden = false;
+    els.menu.hidden = false;
     const customer = (me.customers || []).find((c) => c.customer === me.customer);
     els.whoName.textContent = customer && customer.name !== me.name ? `${me.name} as ${customer.name}` : me.name;
     els.resetBank.hidden = me.kind !== "guest";
     els.switchCustomer.hidden = !(me.kind === "owner" && (me.customers || []).length);
     renderNotice();
     resetConversation(false);   // clear the page, keep the saved conversation id
+    conversations = []; showAllConvos = false;
+    renderConversations();
     await restore();
+    await refreshConversations();
     if (window.matchMedia("(max-width: 52rem)").matches) $("trace-toggle").open = false;
     els.input.focus();
   }
@@ -473,7 +997,12 @@
   });
   els.input.addEventListener("input", autosize);
   document.querySelectorAll(".suggestion").forEach((b) => b.addEventListener("click", () => send(b.textContent)));
-  els.newChat.addEventListener("click", () => { if (!busy) { resetConversation(); els.input.focus(); } });
+  els.convoNew.addEventListener("click", newConversation);
+  els.menu.addEventListener("click", () => (els.panel.classList.contains("open") ? closeMenu() : openMenu()));
+  els.convoClose.addEventListener("click", () => closeMenu());
+  els.scrim.addEventListener("click", () => closeMenu());
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMenu(); });
+  narrow.addEventListener("change", () => closeMenu(false));   // e.g. a tablet turned sideways
   els.signOut.addEventListener("click", async () => {
     try { await api("/api/logout", {}); } catch { /* already signed out */ }
     store.del(threadKey());
@@ -486,6 +1015,7 @@
       await api("/api/guest/reset", {});
       resetConversation();
       await refreshAllowance();
+      await refreshConversations();
     } catch (err) {
       addMessage("bank", err.message, { error: true });
     } finally { busy = false; setComposer(true); }
